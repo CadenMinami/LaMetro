@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# Wrapper around `cdk` that:
+#  1. Sources .env (if present) so LA_METRO_API_KEY / LA_METRO_FEED_URL flow into CDK.
+#  2. Rebuilds the ingestion Lambda asset before any deploy/synth.
+#  3. Forwards all args to `cdk` running inside the cdk/ directory.
+#
+# Usage: scripts/cdk synth | scripts/cdk diff | scripts/cdk deploy [stack]
+
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+
+if [[ -f "$REPO_ROOT/.env" ]]; then
+  set -a
+  # shellcheck disable=SC1091
+  source "$REPO_ROOT/.env"
+  set +a
+fi
+
+# Always rebuild the Lambda asset so deploy reflects current handler.py
+"$REPO_ROOT/scripts/build-lambda.sh" ingestion >/dev/null
+
+cd "$REPO_ROOT/cdk"
+exec npx cdk "$@"

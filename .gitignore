@@ -1,0 +1,40 @@
+# Secrets — never commit
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.Python
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+
+# Node / CDK
+node_modules/
+dist/
+*.tsbuildinfo
+cdk.out/
+.cdk.staging/
+
+# AWS
+.aws-sam/
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*~
+
+# Lambda build artifacts
+lambdas/**/.build/
+lambdas/**/.layer/
