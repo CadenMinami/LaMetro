@@ -5,6 +5,9 @@
 *.pem
 *.key
 
+# Personal/AI-assistant working notes — kept local only
+claude.md
+
 # Python
 __pycache__/
 *.py[cod]
