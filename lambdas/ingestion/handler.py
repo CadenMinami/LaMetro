@@ -13,6 +13,7 @@ import time
 import urllib.request
 from typing import Any
 
+import boto3
 from google.transit import gtfs_realtime_pb2
 
 logger = logging.getLogger()
@@ -25,8 +26,32 @@ FEED_URL = os.environ.get(
     "LA_METRO_FEED_URL",
     "https://api.goswift.ly/real-time/lametro/gtfs-rt-vehicle-positions",
 )
-API_KEY = os.environ.get("LA_METRO_API_KEY", "")
+SECRET_NAME = os.environ.get("SWIFTLY_SECRET_NAME", "")
+# Local-dev escape hatch: skip Secrets Manager and read the key directly.
+LOCAL_API_KEY = os.environ.get("LA_METRO_API_KEY", "")
 HTTP_TIMEOUT_SECONDS = float(os.environ.get("HTTP_TIMEOUT_SECONDS", "8"))
+
+_secrets_client = None
+_cached_api_key: str | None = None
+
+
+def get_api_key() -> str:
+    """Resolve the Swiftly key, preferring local env var, else Secrets Manager.
+
+    Cached at module scope: cold start pays the SM call, warm invocations don't.
+    """
+    global _secrets_client, _cached_api_key
+    if LOCAL_API_KEY:
+        return LOCAL_API_KEY
+    if _cached_api_key is not None:
+        return _cached_api_key
+    if not SECRET_NAME:
+        raise RuntimeError("SWIFTLY_SECRET_NAME not set and no LA_METRO_API_KEY fallback")
+    if _secrets_client is None:
+        _secrets_client = boto3.client("secretsmanager")
+    resp = _secrets_client.get_secret_value(SecretId=SECRET_NAME)
+    _cached_api_key = resp["SecretString"]
+    return _cached_api_key
 
 
 def fetch_feed(url: str, timeout: float, api_key: str = "") -> bytes:
@@ -70,7 +95,7 @@ def summarize(feed: gtfs_realtime_pb2.FeedMessage) -> dict[str, Any]:
 def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     start = time.monotonic()
     try:
-        payload = fetch_feed(FEED_URL, HTTP_TIMEOUT_SECONDS, API_KEY)
+        payload = fetch_feed(FEED_URL, HTTP_TIMEOUT_SECONDS, get_api_key())
         feed = parse_feed(payload)
         summary = summarize(feed)
     except Exception as exc:

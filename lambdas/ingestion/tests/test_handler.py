@@ -51,7 +51,8 @@ def test_summarize_handles_empty_feed():
 
 def test_lambda_handler_returns_ok_on_successful_fetch():
     payload = _build_feed_with_vehicles(2)
-    with patch.object(handler, "fetch_feed", return_value=payload):
+    with patch.object(handler, "fetch_feed", return_value=payload), \
+         patch.object(handler, "get_api_key", return_value="test-key"):
         result = handler.lambda_handler({}, None)
 
     assert result["ok"] is True
@@ -60,7 +61,8 @@ def test_lambda_handler_returns_ok_on_successful_fetch():
 
 
 def test_lambda_handler_returns_error_on_fetch_failure():
-    with patch.object(handler, "fetch_feed", side_effect=RuntimeError("boom")):
+    with patch.object(handler, "fetch_feed", side_effect=RuntimeError("boom")), \
+         patch.object(handler, "get_api_key", return_value="test-key"):
         result = handler.lambda_handler({}, None)
 
     assert result["ok"] is False
