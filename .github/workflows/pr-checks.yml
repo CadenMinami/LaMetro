@@ -35,10 +35,12 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - name: Build Lambda asset
+      - name: Build Lambda assets
         run: |
           chmod +x scripts/build-lambda.sh
-          scripts/build-lambda.sh ingestion
+          for d in ingestion enrichment query_api; do
+            scripts/build-lambda.sh "$d"
+          done
       - name: Install CDK deps
         working-directory: cdk
         run: npm ci
