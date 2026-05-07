@@ -17,7 +17,11 @@ jobs:
           cache: pip
       - name: Install Lambda + test deps
         run: |
-          pip install -r lambdas/ingestion/requirements.txt
+          # Install each lambda's third-party deps. Their requirements.txt
+          # files exist for the build script; we leverage them here too.
+          for f in lambdas/*/requirements.txt; do
+            pip install -r "$f"
+          done
           # boto3 ships in the Lambda runtime so it isn't in any
           # requirements.txt, but tests + enrichment/query_api handlers
           # import it, so install it explicitly for CI.

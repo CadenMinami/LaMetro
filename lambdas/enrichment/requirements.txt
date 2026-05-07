@@ -1,2 +1,4 @@
-# boto3 is included in the Lambda Python runtime — no need to bundle.
-# This file exists so the build script knows the lambda has no external deps.
+# boto3 ships with the Lambda runtime — no need to bundle.
+# Shapely 2.x bundles GEOS as a C library; build-lambda.sh pins
+# manylinux2014_aarch64 wheels for Lambda's ARM64 runtime.
+shapely>=2.0,<3
