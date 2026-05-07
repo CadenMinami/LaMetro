@@ -40,8 +40,9 @@ const processing = new ProcessingStack(app, 'LaMetro-ProcessingStack', {
   vehicleStream: storage.vehicleStream,
   hotVehiclesTable: storage.hotVehiclesTable,
   routeAggregatesTable: storage.routeAggregatesTable,
+  archiveBucket: storage.archiveBucket,
   description:
-    'Processing: Enrichment Lambda (Kinesis → DynamoDB) + Aggregation Lambda (every 1m).',
+    'Processing: Enrichment Lambda (Kinesis → DynamoDB + delay) + Aggregation (every 1m).',
 });
 
 const api = new ApiStack(app, 'LaMetro-ApiStack', {

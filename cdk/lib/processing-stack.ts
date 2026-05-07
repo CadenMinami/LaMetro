@@ -5,6 +5,7 @@ import * as lambda from 'aws-cdk-lib/aws-lambda';
 import * as logs from 'aws-cdk-lib/aws-logs';
 import * as kinesis from 'aws-cdk-lib/aws-kinesis';
 import * as dynamodb from 'aws-cdk-lib/aws-dynamodb';
+import * as s3 from 'aws-cdk-lib/aws-s3';
 import * as eventsources from 'aws-cdk-lib/aws-lambda-event-sources';
 import * as events from 'aws-cdk-lib/aws-events';
 import * as targets from 'aws-cdk-lib/aws-events-targets';
@@ -13,6 +14,9 @@ export interface ProcessingStackProps extends cdk.StackProps {
   vehicleStream: kinesis.IStream;
   hotVehiclesTable: dynamodb.ITable;
   routeAggregatesTable: dynamodb.ITable;
+  // Phase 4c: bucket where the parsed GTFS-static pickle lives. Enrichment
+  // Lambda reads it on cold start and caches in module memory.
+  archiveBucket: s3.IBucket;
 }
 
 /**
@@ -42,18 +46,25 @@ export class ProcessingStack extends cdk.Stack {
       architecture: lambda.Architecture.ARM_64,
       handler: 'handler.lambda_handler',
       code: lambda.Code.fromAsset(lambdaAssetPath),
-      memorySize: 512,
+      // Phase 4c: holds the GTFS static (LineStrings + schedule tuples) in
+      // module memory. Even with shape dedup, peak memory hits ~600-800 MB.
+      memorySize: 1024,
       timeout: cdk.Duration.seconds(60),
       environment: {
         HOT_VEHICLES_TABLE_NAME: props.hotVehiclesTable.tableName,
         GEOHASH_PRECISION: '6',
         HOT_VEHICLE_TTL_SECONDS: '3600',
+        GTFS_STATIC_BUCKET: props.archiveBucket.bucketName,
+        GTFS_STATIC_POINTER_KEY: 'gtfs-static/current.txt',
+        AGENCY_TIMEZONE: 'America/Los_Angeles',
       },
       logGroup,
-      description: 'Phase 2: Kinesis trigger → hot-vehicles DynamoDB. No delay calc yet.',
+      description: 'Phase 4c: Kinesis trigger → hot-vehicles + schedule deviation.',
     });
 
     props.hotVehiclesTable.grantWriteData(enrichmentFn);
+    // Read the GTFS static pickle and the `current.txt` pointer.
+    props.archiveBucket.grantRead(enrichmentFn, 'gtfs-static/*');
 
     enrichmentFn.addEventSource(
       new eventsources.KinesisEventSource(props.vehicleStream, {
