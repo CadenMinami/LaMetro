@@ -1,0 +1,2 @@
+# boto3 is included in the Lambda Python runtime — no need to bundle.
+# This file exists so the build script knows the lambda has no external deps.

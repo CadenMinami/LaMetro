@@ -3,6 +3,10 @@ import 'source-map-support/register';
 import * as cdk from 'aws-cdk-lib';
 import { IngestionStack } from '../lib/ingestion-stack';
 import { BillingStack } from '../lib/billing-stack';
+import { StorageStack } from '../lib/storage-stack';
+import { ProcessingStack } from '../lib/processing-stack';
+import { ApiStack } from '../lib/api-stack';
+import { FrontendStack } from '../lib/frontend-stack';
 
 const app = new cdk.App();
 
@@ -18,11 +22,35 @@ const tags = {
   ManagedBy: 'cdk',
 };
 
+const storage = new StorageStack(app, 'LaMetro-StorageStack', {
+  env,
+  description: 'Phase 2 storage: Kinesis stream, DynamoDB hot table, S3 archive.',
+});
+
 const ingestion = new IngestionStack(app, 'LaMetro-IngestionStack', {
   env,
   swiftlySecretName: process.env.SWIFTLY_SECRET_NAME ?? 'la-metro/swiftly-api-key',
   laMetroFeedUrl: process.env.LA_METRO_FEED_URL,
+  vehicleStream: storage.vehicleStream,
   description: 'LA Metro GTFS-RT ingestion Lambda + EventBridge schedule.',
+});
+
+const processing = new ProcessingStack(app, 'LaMetro-ProcessingStack', {
+  env,
+  vehicleStream: storage.vehicleStream,
+  hotVehiclesTable: storage.hotVehiclesTable,
+  description: 'Phase 2 processing: Enrichment Lambda (Kinesis → DynamoDB).',
+});
+
+const api = new ApiStack(app, 'LaMetro-ApiStack', {
+  env,
+  hotVehiclesTable: storage.hotVehiclesTable,
+  description: 'Phase 2 read API: GET /vehicles?bbox=… backed by a Lambda + REST API Gateway.',
+});
+
+const frontend = new FrontendStack(app, 'LaMetro-FrontendStack', {
+  env,
+  description: 'Phase 3 frontend: S3 + CloudFront serving the Next.js static export.',
 });
 
 // Billing alarms must live in us-east-1 — that's the only region where AWS
@@ -35,7 +63,7 @@ const billing = new BillingStack(app, 'LaMetro-BillingStack', {
   description: 'Cost guardrails: SNS-backed CloudWatch billing alarms + monthly Budget.',
 });
 
-for (const stack of [ingestion, billing]) {
+for (const stack of [storage, ingestion, processing, api, frontend, billing]) {
   for (const [k, v] of Object.entries(tags)) {
     cdk.Tags.of(stack).add(k, v);
   }
