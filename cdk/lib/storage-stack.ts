@@ -23,6 +23,7 @@ export interface StorageStackProps extends cdk.StackProps {
 export class StorageStack extends cdk.Stack {
   public readonly vehicleStream: kinesis.Stream;
   public readonly hotVehiclesTable: dynamodb.Table;
+  public readonly routeAggregatesTable: dynamodb.Table;
   public readonly archiveBucket: s3.Bucket;
 
   constructor(scope: Construct, id: string, props: StorageStackProps = {}) {
@@ -54,6 +55,18 @@ export class StorageStack extends cdk.Stack {
       partitionKey: { name: 'route_id', type: dynamodb.AttributeType.STRING },
       sortKey: { name: 'last_updated', type: dynamodb.AttributeType.STRING },
       projectionType: dynamodb.ProjectionType.ALL,
+    });
+
+    // Phase 4b: rolling per-route, per-5-min-window stats. Updated every minute
+    // by the Aggregation Lambda; consumed by /routes/{routeId} on the frontend.
+    // 7-day TTL keeps the table small without losing the day's history.
+    this.routeAggregatesTable = new dynamodb.Table(this, 'RouteAggregatesTable', {
+      tableName: 'la-metro-route-aggregates',
+      partitionKey: { name: 'route_id', type: dynamodb.AttributeType.STRING },
+      sortKey: { name: 'window_start_iso', type: dynamodb.AttributeType.STRING },
+      billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
+      timeToLiveAttribute: 'ttl_epoch',
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
     });
 
     this.archiveBucket = new s3.Bucket(this, 'ArchiveBucket', {
@@ -169,6 +182,7 @@ export class StorageStack extends cdk.Stack {
     new cdk.CfnOutput(this, 'VehicleStreamName', { value: this.vehicleStream.streamName });
     new cdk.CfnOutput(this, 'VehicleStreamArn', { value: this.vehicleStream.streamArn });
     new cdk.CfnOutput(this, 'HotVehiclesTableName', { value: this.hotVehiclesTable.tableName });
+    new cdk.CfnOutput(this, 'RouteAggregatesTableName', { value: this.routeAggregatesTable.tableName });
     new cdk.CfnOutput(this, 'ArchiveBucketName', { value: this.archiveBucket.bucketName });
   }
 }

@@ -41,7 +41,7 @@ jobs:
       - name: Build Lambda assets
         run: |
           chmod +x scripts/build-lambda.sh
-          for d in ingestion enrichment query_api; do
+          for d in ingestion enrichment query_api aggregation; do
             scripts/build-lambda.sh "$d"
           done
       - name: Build frontend static export

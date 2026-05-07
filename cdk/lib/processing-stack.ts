@@ -6,10 +6,13 @@ import * as logs from 'aws-cdk-lib/aws-logs';
 import * as kinesis from 'aws-cdk-lib/aws-kinesis';
 import * as dynamodb from 'aws-cdk-lib/aws-dynamodb';
 import * as eventsources from 'aws-cdk-lib/aws-lambda-event-sources';
+import * as events from 'aws-cdk-lib/aws-events';
+import * as targets from 'aws-cdk-lib/aws-events-targets';
 
 export interface ProcessingStackProps extends cdk.StackProps {
   vehicleStream: kinesis.IStream;
   hotVehiclesTable: dynamodb.ITable;
+  routeAggregatesTable: dynamodb.ITable;
 }
 
 /**
@@ -69,5 +72,49 @@ export class ProcessingStack extends cdk.Stack {
     );
 
     new cdk.CfnOutput(this, 'EnrichmentFnName', { value: enrichmentFn.functionName });
+
+    // ----- Phase 4b: Aggregation Lambda -----
+    // Triggered every minute. Scans hot-vehicles, groups by route, writes
+    // 5-min-bucket rolling stats to route-aggregates.
+    const aggAssetPath = path.join(__dirname, '..', '..', 'lambdas', 'aggregation', '.build');
+    const aggFunctionName = 'la-metro-aggregation';
+
+    const aggLogGroup = new logs.LogGroup(this, 'AggregationFnLogs', {
+      logGroupName: `/aws/lambda/${aggFunctionName}`,
+      retention: logs.RetentionDays.ONE_WEEK,
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+    });
+
+    const aggregationFn = new lambda.Function(this, 'AggregationFn', {
+      functionName: aggFunctionName,
+      runtime: lambda.Runtime.PYTHON_3_12,
+      architecture: lambda.Architecture.ARM_64,
+      handler: 'handler.lambda_handler',
+      code: lambda.Code.fromAsset(aggAssetPath),
+      memorySize: 512,
+      // 60s budget — DDB scan + per-route writes for ~150 routes is well under
+      // 10s in practice. Cushion is for cold starts.
+      timeout: cdk.Duration.seconds(60),
+      environment: {
+        HOT_VEHICLES_TABLE_NAME: props.hotVehiclesTable.tableName,
+        ROUTE_AGGREGATES_TABLE_NAME: props.routeAggregatesTable.tableName,
+      },
+      logGroup: aggLogGroup,
+      description: 'Phase 4b: rolling per-route stats every minute.',
+    });
+
+    props.hotVehiclesTable.grantReadData(aggregationFn);
+    props.routeAggregatesTable.grantWriteData(aggregationFn);
+
+    // EventBridge: rate(1 minute). Cron would also work but rate is simpler
+    // for "every N minutes" without needing AWS's UTC cron expressions.
+    new events.Rule(this, 'AggregationSchedule', {
+      ruleName: 'la-metro-aggregation-schedule',
+      schedule: events.Schedule.rate(cdk.Duration.minutes(1)),
+      targets: [new targets.LambdaFunction(aggregationFn)],
+      description: 'Triggers the Aggregation Lambda once per minute.',
+    });
+
+    new cdk.CfnOutput(this, 'AggregationFnName', { value: aggregationFn.functionName });
   }
 }
