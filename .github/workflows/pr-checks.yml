@@ -18,7 +18,10 @@ jobs:
       - name: Install Lambda + test deps
         run: |
           pip install -r lambdas/ingestion/requirements.txt
-          pip install pytest
+          # boto3 ships in the Lambda runtime so it isn't in any
+          # requirements.txt, but tests + enrichment/query_api handlers
+          # import it, so install it explicitly for CI.
+          pip install pytest boto3
       - name: Run pytest
         run: pytest lambdas/
 
@@ -41,6 +44,13 @@ jobs:
           for d in ingestion enrichment query_api; do
             scripts/build-lambda.sh "$d"
           done
+      - name: Build frontend static export
+        # FrontendStack uses frontend/out as a CDK asset. /out is gitignored,
+        # so CI must produce it before `cdk synth`.
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run build
       - name: Install CDK deps
         working-directory: cdk
         run: npm ci
