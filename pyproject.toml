@@ -4,3 +4,6 @@
 addopts = "--import-mode=importlib"
 testpaths = ["lambdas"]
 norecursedirs = [".venv*", ".build", "node_modules", "cdk.out"]
+# Put the repo root on sys.path so tests can do `from lambdas.<x> import handler`.
+# importlib mode doesn't auto-add rootdir, so we add it explicitly.
+pythonpath = ["."]
