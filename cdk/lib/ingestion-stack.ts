@@ -6,10 +6,12 @@ import * as logs from 'aws-cdk-lib/aws-logs';
 import * as events from 'aws-cdk-lib/aws-events';
 import * as targets from 'aws-cdk-lib/aws-events-targets';
 import * as secretsmanager from 'aws-cdk-lib/aws-secretsmanager';
+import * as kinesis from 'aws-cdk-lib/aws-kinesis';
 
 export interface IngestionStackProps extends cdk.StackProps {
   swiftlySecretName: string;
   laMetroFeedUrl?: string;
+  vehicleStream: kinesis.IStream;
 }
 
 export class IngestionStack extends cdk.Stack {
@@ -25,8 +27,6 @@ export class IngestionStack extends cdk.Stack {
       removalPolicy: cdk.RemovalPolicy.DESTROY,
     });
 
-    // Reference an existing secret by name — created out-of-band via the AWS
-    // CLI so the key value never lands in the CloudFormation template.
     const swiftlySecret = secretsmanager.Secret.fromSecretNameV2(
       this,
       'SwiftlySecret',
@@ -40,16 +40,18 @@ export class IngestionStack extends cdk.Stack {
       handler: 'handler.lambda_handler',
       code: lambda.Code.fromAsset(lambdaAssetPath),
       memorySize: 512,
-      timeout: cdk.Duration.seconds(15),
+      timeout: cdk.Duration.seconds(30),
       environment: {
         SWIFTLY_SECRET_NAME: props.swiftlySecretName,
+        VEHICLE_STREAM_NAME: props.vehicleStream.streamName,
         ...(props.laMetroFeedUrl ? { LA_METRO_FEED_URL: props.laMetroFeedUrl } : {}),
       },
       logGroup,
-      description: 'Phase 1: fetches LA Metro GTFS-RT, logs vehicle count.',
+      description: 'Phase 2: fetches LA Metro GTFS-RT, emits one Kinesis record per vehicle.',
     });
 
     swiftlySecret.grantRead(ingestionFn);
+    props.vehicleStream.grantWrite(ingestionFn);
 
     const rule = new events.Rule(this, 'IngestionSchedule', {
       ruleName: 'la-metro-ingestion-every-minute',
