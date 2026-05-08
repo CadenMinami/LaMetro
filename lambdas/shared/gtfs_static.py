@@ -1,25 +1,22 @@
 """Load a parsed GTFS-static pickle from S3 and turn it into in-memory
 structures the deviation algorithm can use.
 
-The pickle layout is whatever `scripts/load-gtfs-static.py` writes:
+The slim pickle layout (post-Phase 4c) is what `scripts/load-gtfs-static.py`
+emits — pre-computed, tuple-based, no per-row dicts:
 
     {
       "feed_version": str,
-      "trips":      {trip_id: {"route_id", "service_id", "shape_id", ...}},
-      "stop_times": {trip_id: [{"stop_id", "stop_sequence", "arr_s",
-                                "dep_s", "shape_dist_traveled"}, ...]},
-      "stops":      {stop_id: {"lat", "lon", "name"}},
-      "shapes":     {shape_id: [(lat, lon, dist_traveled), ...]},
+      "trips":     {trip_id: (route_id, shape_id)},
+      "schedules": {trip_id: ((time_s, dist_m), ...)},  # already algorithm-ready
+      "shapes":    {shape_id: ((lat, lon), ...)},
     }
 
-We turn that into the algorithm-ready form:
-
-    GTFSStatic.shapes:   {shape_id: shapely.LineString in projected meters}
-    GTFSStatic.trip_idx: {trip_id: TripIndex(shape_id, schedule_tuples)}
-
-Sharing LineStrings across trips with the same shape_id is the big memory
-win — LA Metro has ~700 distinct shapes feeding ~38k trips, so we collapse
-the most expensive per-trip object by ~50×.
+The Lambda only needs to wrap each shape's lat/lon tuple in a Shapely
+LineString (in projected meters) and copy the `trips`/`schedules` dicts
+into the dataclass. Sharing one LineString per shape_id across the trips
+that reference it (~700 unique shapes feed ~38k trips) is the big memory
+win. The legacy fat-dict layout is no longer accepted — the loader was
+updated in lockstep.
 """
 
 from __future__ import annotations
@@ -69,12 +66,14 @@ class GTFSStatic:
 
 
 def _build_linestring(
-    pts: list[tuple[float, float, float | None]],
+    pts: tuple[tuple[float, ...], ...] | list[tuple[float, ...]],
 ) -> LineString | None:
-    """pts is a list of (lat, lon, dist) sorted by sequence. We only need
-    (lat, lon) for the geometry; dist is consumed elsewhere if present."""
+    """pts is a sequence of (lat, lon) tuples sorted by sequence. Tolerates
+    legacy (lat, lon, dist) triples from older pickles by ignoring the third
+    field — keeps a Lambda with stale cache from crashing during rollover."""
     coords: list[tuple[float, float]] = []
-    for lat, lon, _dist in pts:
+    for pt in pts:
+        lat, lon = pt[0], pt[1]
         xy = latlon_to_xy(lat, lon)
         if not coords or coords[-1] != xy:
             coords.append(xy)
@@ -83,45 +82,10 @@ def _build_linestring(
     return LineString(coords)
 
 
-def _build_schedule_for_trip(
-    stop_times: list[dict[str, Any]],
-    shape: LineString | None,
-    stops_by_id: dict[str, dict[str, Any]],
-) -> tuple[tuple[int, float], ...]:
-    """Build the (time_s, dist_m) schedule for a trip.
-
-    Prefer GTFS's `shape_dist_traveled` when present (LA Metro provides it).
-    Fall back to projecting each stop's (lat, lon) onto the shape — slower
-    but works for feeds that don't ship distances.
-    """
-    out: list[tuple[int, float]] = []
-    for st in stop_times:
-        # Use departure if present, else arrival. Either is fine for a
-        # mid-route position estimate.
-        t = st.get("dep_s")
-        if t is None:
-            t = st.get("arr_s")
-        if t is None:
-            continue
-        dist = st.get("shape_dist_traveled")
-        if dist is None and shape is not None:
-            stop = stops_by_id.get(st["stop_id"])
-            if stop is None:
-                continue
-            point = Point(*latlon_to_xy(stop["lat"], stop["lon"]))
-            dist = shape.project(point)
-        if dist is None:
-            continue
-        out.append((int(t), float(dist)))
-    # Sort by distance, not by stop_sequence — matters if a feed has the
-    # vehicle backtrack (rare; usually a data error).
-    out.sort(key=lambda x: x[1])
-    return tuple(out)
-
-
 def build_static(parsed: dict[str, Any]) -> GTFSStatic:
-    """Convert a parsed GTFS dict (from scripts/load-gtfs-static.py) into
-    algorithm-ready in-memory structures."""
+    """Convert the slim parsed GTFS dict into algorithm-ready in-memory
+    structures. Wraps each shape's lat/lon tuple in a Shapely LineString and
+    copies the pre-computed schedules straight through."""
     started = time.monotonic()
 
     raw_shapes = parsed.get("shapes", {})
@@ -131,29 +95,36 @@ def build_static(parsed: dict[str, Any]) -> GTFSStatic:
         if ls is not None:
             shapes[shape_id] = ls
 
-    stops_by_id = parsed.get("stops", {})
     raw_trips = parsed.get("trips", {})
-    raw_stop_times = parsed.get("stop_times", {})
+    raw_schedules = parsed.get("schedules", {})
 
     trip_idx: dict[str, TripIndex] = {}
     trip_route: dict[str, str] = {}
     skipped_no_shape = 0
     skipped_no_schedule = 0
 
-    for trip_id, t in raw_trips.items():
-        shape_id = t.get("shape_id", "")
+    for trip_id, meta in raw_trips.items():
+        # `meta` is (route_id, shape_id) in the slim format.
+        if isinstance(meta, dict):
+            # Legacy fat-dict format — still tolerate it for older pickles
+            # that haven't been re-uploaded yet. Will be removed once
+            # confident.
+            route_id = meta.get("route_id", "")
+            shape_id = meta.get("shape_id", "")
+        else:
+            route_id, shape_id = meta
         shape = shapes.get(shape_id) if shape_id else None
         if shape is None:
             skipped_no_shape += 1
             continue
-        sts = raw_stop_times.get(trip_id, [])
-        schedule = _build_schedule_for_trip(sts, shape, stops_by_id)
+        schedule = raw_schedules.get(trip_id)
         if not schedule:
             skipped_no_schedule += 1
             continue
-        trip_idx[trip_id] = TripIndex(shape_id=shape_id, schedule=schedule)
-        if t.get("route_id"):
-            trip_route[trip_id] = t["route_id"]
+        # The pickle's schedule is already a tuple of (int_time, float_dist).
+        trip_idx[trip_id] = TripIndex(shape_id=shape_id, schedule=tuple(schedule))
+        if route_id:
+            trip_route[trip_id] = route_id
 
     elapsed_ms = int((time.monotonic() - started) * 1000)
     logger.info(
