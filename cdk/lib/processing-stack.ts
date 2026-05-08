@@ -9,6 +9,7 @@ import * as s3 from 'aws-cdk-lib/aws-s3';
 import * as eventsources from 'aws-cdk-lib/aws-lambda-event-sources';
 import * as events from 'aws-cdk-lib/aws-events';
 import * as targets from 'aws-cdk-lib/aws-events-targets';
+import type { WebSocketStack } from './websocket-stack';
 
 export interface ProcessingStackProps extends cdk.StackProps {
   vehicleStream: kinesis.IStream;
@@ -17,6 +18,11 @@ export interface ProcessingStackProps extends cdk.StackProps {
   // Phase 4c: bucket where the parsed GTFS-static pickle lives. Enrichment
   // Lambda reads it on cold start and caches in module memory.
   archiveBucket: s3.IBucket;
+  // Phase 5b: subscriber registry that the enrichment Lambda scans every
+  // ~minute, plus the WebSocket stack itself so we can grant manage perms
+  // and wire the callback URL through env.
+  websocketConnectionsTable: dynamodb.ITable;
+  websocketStack: WebSocketStack;
 }
 
 /**
@@ -60,14 +66,20 @@ export class ProcessingStack extends cdk.Stack {
         GTFS_STATIC_BUCKET: props.archiveBucket.bucketName,
         GTFS_STATIC_POINTER_KEY: 'gtfs-static/current.txt',
         AGENCY_TIMEZONE: 'America/Los_Angeles',
+        // Phase 5b: WebSocket fan-out targets. Empty values disable broadcast.
+        WEBSOCKET_CALLBACK_URL: props.websocketStack.callbackUrl,
+        WEBSOCKET_CONNECTIONS_TABLE_NAME: props.websocketConnectionsTable.tableName,
       },
       logGroup,
-      description: 'Phase 4c: Kinesis trigger → hot-vehicles + schedule deviation.',
+      description: 'Phase 5b: Kinesis → hot-vehicles + delay + WebSocket fan-out.',
     });
 
     props.hotVehiclesTable.grantWriteData(enrichmentFn);
-    // Read the GTFS static pickle and the `current.txt` pointer.
     props.archiveBucket.grantRead(enrichmentFn, 'gtfs-static/*');
+    // Phase 5b: scan connections (read) + drop stale rows (write). Plus
+    // `execute-api:ManageConnections` so the management API call lands.
+    props.websocketConnectionsTable.grantReadWriteData(enrichmentFn);
+    props.websocketStack.grantManageConnections(enrichmentFn);
 
     enrichmentFn.addEventSource(
       new eventsources.KinesisEventSource(props.vehicleStream, {
