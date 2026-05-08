@@ -79,27 +79,51 @@ def fetch_zip(url: str, timeout: float = 60.0) -> bytes:
     return data
 
 
+_MERGE_DICT_KEYS = (
+    "trips",
+    "schedules",
+    "shapes",
+    "stops",
+    "stop_arrivals",
+    "trip_service",
+    "service_calendar",
+    "service_exceptions",
+)
+
+
 def merge_static(parts: list[dict[str, Any]]) -> dict[str, Any]:
-    """Merge multiple parsed GTFS dicts (e.g., bus + rail) into one slim
-    structure. LA Metro uses disjoint trip_ids/shape_ids across bus and rail,
-    so simple dict.update() works."""
+    """Merge multiple parsed GTFS dicts (e.g., bus + rail) into one v2 pickle.
+
+    LA Metro uses disjoint trip_ids/shape_ids/stop_ids across bus and rail, so
+    simple dict.update() works for those. service_ids occasionally overlap
+    (both feeds may define a "WD" weekday calendar) but the entries are
+    functionally identical, so last-write-wins is safe; we log collisions
+    so a real divergence shows up loud.
+    """
     merged: dict[str, Any] = {
-        "feed_version": "+".join(p["feed_version"] for p in parts),
-        "feed_start_date": None,
-        "feed_end_date": None,
-        "trips": {},
-        "schedules": {},
-        "shapes": {},
+        "schema_version": 2,
+        "feed_version": "+".join((p.get("feed_version") or "") for p in parts),
+        "feed_start_date": next(
+            (p.get("feed_start_date") for p in parts if p.get("feed_start_date")),
+            None,
+        ),
+        "feed_end_date": next(
+            (p.get("feed_end_date") for p in parts if p.get("feed_end_date")),
+            None,
+        ),
+        **{key: {} for key in _MERGE_DICT_KEYS},
     }
-    collisions = {"trips": 0, "schedules": 0, "shapes": 0}
+    collisions = {key: 0 for key in _MERGE_DICT_KEYS}
     for part in parts:
-        for key in ("trips", "schedules", "shapes"):
+        for key in _MERGE_DICT_KEYS:
+            existing = merged[key]
             for sub_id in part.get(key, {}):
-                if sub_id in merged[key]:
+                if sub_id in existing:
                     collisions[key] += 1
-            merged[key].update(part.get(key, {}))
-    if any(collisions.values()):
-        print(f"⚠️  trip/schedule/shape id collisions while merging: {collisions}")
+            existing.update(part.get(key, {}))
+    nonzero = {k: v for k, v in collisions.items() if v}
+    if nonzero:
+        print(f"⚠️  id collisions while merging: {nonzero}")
     return merged
 
 
@@ -111,24 +135,31 @@ def _read_csv(zf: zipfile.ZipFile, name: str) -> list[dict[str, str]]:
 
 
 def parse_static(zip_bytes: bytes) -> dict[str, Any]:
-    """Parse GTFS static zip into a slim, algorithm-ready dict.
+    """Parse GTFS static zip into a slim, algorithm-ready dict (schema v2).
 
-    The Lambda that consumes this only needs:
+    The Lambdas that consume this need two distinct slices of the data:
+
+      *Phase 4c deviation* (enrichment Lambda):
       - trip_id → (route_id, shape_id) for routing decisions and route fallback.
       - trip_id → schedule tuple of (time_seconds_into_day, dist_along_shape_m)
         — pre-computed here so the Lambda never has to do per-row work.
       - shape_id → tuple of (lat, lon) — projected to LineString lazily on load.
 
-    We deliberately drop stops, stop_sequence, direction_id, service_id, names,
-    and per-row shape_dist points — they would balloon the pickle from ~10 MB
-    (this layout) to ~110 MB (full dict-of-dicts), and the Lambda doesn't need
-    them. The dist_traveled field on shape rows is dropped because we
-    re-derive it from cumulative segment length when building the LineString.
+      *Phase 4d arrivals* (query Lambda):
+      - stop_id → metadata + lightweight per-stop arrival index pivoted from
+        stop_times.txt, so a single dict lookup answers "what trips serve this
+        stop?".
+      - service_calendar + service_exceptions to filter trips active *today*
+        (GTFS calendars are weekday-bitmask + exceptions overlay).
+      - trip_id → service_id so each candidate trip can be filtered against
+        active services without re-reading trips.txt at runtime.
 
     A trip is included in `schedules` only when we can produce a non-empty
     (time, distance) sequence — either via shape_dist_traveled in
     stop_times.txt (LA Metro provides it) or by projecting each stop's
-    (lat, lon) onto the shape geometry. Trips with neither are skipped.
+    (lat, lon) onto the shape geometry. Trips with neither still appear in
+    `stop_arrivals` so the arrivals API can return them with status="scheduled"
+    (no live deviation possible without a schedule curve).
     """
     with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
         names = set(zf.namelist())
@@ -151,31 +182,96 @@ def parse_static(zip_bytes: bytes) -> dict[str, Any]:
             feed_version = dt.date.today().isoformat()
 
         # ---- trips.txt → trip_id -> (route_id, shape_id)
+        # We also collect service_id alongside, into trip_service, so the
+        # arrivals API can filter to today's active trips without reading
+        # trips.txt at runtime.
         trips: dict[str, tuple[str, str]] = {}
+        trip_service: dict[str, str] = {}
+        trip_route_local: dict[str, str] = {}  # used while building stop_arrivals
         for row in _read_csv(zf, "trips.txt"):
-            trips[row["trip_id"]] = (
-                row.get("route_id", ""),
-                row.get("shape_id", ""),
-            )
+            trip_id = row["trip_id"]
+            route_id = row.get("route_id", "")
+            shape_id = row.get("shape_id", "")
+            service_id = row.get("service_id", "")
+            trips[trip_id] = (route_id, shape_id)
+            if service_id:
+                trip_service[trip_id] = service_id
+            if route_id:
+                trip_route_local[trip_id] = route_id
 
-        # ---- stops.txt — kept temporarily so we can project stops onto shapes
-        # for trips that lack shape_dist_traveled. Discarded before return.
+        # ---- stops.txt
+        # `stops_out` is the public v2 stops table the arrivals API and
+        # frontend will consume. `stops_local` is a thin (lat, lon) lookup
+        # used inside this function for shape projection — kept separate so
+        # we don't pay for the metadata fields during the hot inner loop.
+        stops_out: dict[str, dict[str, Any]] = {}
         stops_local: dict[str, tuple[float, float]] = {}
         for row in _read_csv(zf, "stops.txt"):
             try:
-                stops_local[row["stop_id"]] = (
-                    float(row["stop_lat"]),
-                    float(row["stop_lon"]),
-                )
+                lat = float(row["stop_lat"])
+                lon = float(row["stop_lon"])
             except (KeyError, ValueError):
                 continue
+            stop_id = row["stop_id"]
+            stops_local[stop_id] = (lat, lon)
+            stops_out[stop_id] = {
+                "name": row.get("stop_name", "") or "",
+                "lat": lat,
+                "lon": lon,
+                "code": row.get("stop_code") or None,
+                "parent_station": row.get("parent_station") or None,
+            }
 
-        # ---- stop_times.txt → grouped by trip, sorted by sequence
-        # We collect minimal tuples here (sequence, arr_s, dep_s, dist, stop_id)
-        # then transform into the slim per-trip schedule below.
+        # ---- calendar.txt → service_id -> weekday bitmask + date window
+        # Optional per the GTFS spec, but LA Metro publishes it. When missing
+        # we leave service_calendar empty; the arrivals API treats "no
+        # calendar" as "all services active" so the feature still works.
+        service_calendar: dict[str, dict[str, Any]] = {}
+        if "calendar.txt" in names:
+            for row in _read_csv(zf, "calendar.txt"):
+                sid = row.get("service_id")
+                if not sid:
+                    continue
+                service_calendar[sid] = {
+                    "monday":    row.get("monday")    == "1",
+                    "tuesday":   row.get("tuesday")   == "1",
+                    "wednesday": row.get("wednesday") == "1",
+                    "thursday":  row.get("thursday")  == "1",
+                    "friday":    row.get("friday")    == "1",
+                    "saturday":  row.get("saturday")  == "1",
+                    "sunday":    row.get("sunday")    == "1",
+                    "start_date": row.get("start_date") or "",
+                    "end_date":   row.get("end_date") or "",
+                }
+
+        # ---- calendar_dates.txt → (YYYYMMDD, service_id) -> exception_type
+        # exception_type 1 = service added on this date, 2 = removed.
+        # Holiday schedules ride on this — e.g. a "weekday" service may be
+        # explicitly removed on Christmas Day with type=2.
+        service_exceptions: dict[tuple[str, str], int] = {}
+        if "calendar_dates.txt" in names:
+            for row in _read_csv(zf, "calendar_dates.txt"):
+                sid = row.get("service_id")
+                date = row.get("date")
+                if not sid or not date:
+                    continue
+                try:
+                    etype = int(row.get("exception_type", "0"))
+                except ValueError:
+                    continue
+                if etype in (1, 2):
+                    service_exceptions[(date, sid)] = etype
+
+        # ---- stop_times.txt → two indexes from one pass
+        # `per_trip` (sorted by sequence) feeds the slim per-trip schedule
+        # used by the deviation algorithm. `stop_arrivals_lists` is the
+        # by-stop pivot used by the arrivals API; each entry is
+        # (trip_id, route_id, arr_s, stop_sequence). One pass over ~2M rows
+        # builds both — only a single extra dict insert per row.
         per_trip: dict[str, list[tuple[int, int | None, int | None, float | None, str]]] = (
             defaultdict(list)
         )
+        stop_arrivals_lists: dict[str, list[tuple[str, str, int, int]]] = defaultdict(list)
         for row in _read_csv(zf, "stop_times.txt"):
             try:
                 trip_id = row["trip_id"]
@@ -185,10 +281,26 @@ def parse_static(zip_bytes: bytes) -> dict[str, Any]:
                 dist = _maybe_float(row.get("shape_dist_traveled", ""))
                 stop_id = row.get("stop_id", "")
                 per_trip[trip_id].append((seq, arr, dep, dist, stop_id))
+                # Pivot for the arrivals API. Prefer arrival_time, fall back
+                # to departure_time. Skip if neither — can't predict an
+                # arrival without a time.
+                t_arr = arr if arr is not None else dep
+                if stop_id and t_arr is not None:
+                    route_id = trip_route_local.get(trip_id, "")
+                    stop_arrivals_lists[stop_id].append(
+                        (trip_id, route_id, int(t_arr), seq)
+                    )
             except (KeyError, ValueError):
                 continue
         for stops_seq in per_trip.values():
             stops_seq.sort(key=lambda r: r[0])
+
+        # Sort each stop's arrivals by time so the API can binary-search /
+        # short-circuit on the next-N entries past `now`.
+        stop_arrivals: dict[str, tuple[tuple[str, str, int, int], ...]] = {
+            stop_id: tuple(sorted(rows, key=lambda r: r[2]))
+            for stop_id, rows in stop_arrivals_lists.items()
+        }
 
         # ---- shapes.txt → shape_id -> tuple of (lat, lon) sorted by sequence
         shapes_by_id: dict[str, tuple[tuple[float, float], ...]] = {}
@@ -301,12 +413,20 @@ def parse_static(zip_bytes: bytes) -> dict[str, Any]:
         )
 
     return {
+        "schema_version": 2,
         "feed_version": feed_version,
         "feed_start_date": feed_start,
         "feed_end_date": feed_end,
-        "trips": trips,         # trip_id -> (route_id, shape_id)
-        "schedules": schedules, # trip_id -> tuple of (time_s, dist_m)
-        "shapes": shapes_by_id, # shape_id -> tuple of (lat, lon)
+        # Phase 4c — deviation algorithm
+        "trips": trips,             # trip_id -> (route_id, shape_id)
+        "schedules": schedules,     # trip_id -> tuple of (time_s, dist_m)
+        "shapes": shapes_by_id,     # shape_id -> tuple of (lat, lon)
+        # Phase 4d — arrivals API
+        "stops": stops_out,                       # stop_id -> {name, lat, lon, code, parent_station}
+        "stop_arrivals": stop_arrivals,           # stop_id -> ((trip_id, route_id, arr_s, seq), ...)
+        "service_calendar": service_calendar,     # service_id -> weekday bitmask + window
+        "service_exceptions": service_exceptions, # (YYYYMMDD, service_id) -> 1|2
+        "trip_service": trip_service,             # trip_id -> service_id
     }
 
 
@@ -399,6 +519,7 @@ def _maybe_float(s: str) -> float | None:
 
 
 def summarize(static: dict[str, Any]) -> None:
+    print(f"schema_version     = {static.get('schema_version', 1)}")
     print(f"feed_version       = {static['feed_version']}")
     print(f"feed_start_date    = {static.get('feed_start_date')}")
     print(f"feed_end_date      = {static.get('feed_end_date')}")
@@ -410,6 +531,16 @@ def summarize(static: dict[str, Any]) -> None:
             f"  total schedule rows ≈ {sum(len(v) for v in sched.values()):,}"
         )
     print(f"shapes             = {len(static.get('shapes', {})):,}")
+    print(f"stops              = {len(static.get('stops', {})):,}")
+    arrivals = static.get("stop_arrivals", {})
+    print(f"stop_arrivals      = {len(arrivals):,}")
+    if arrivals:
+        print(
+            f"  total arrival rows ≈ {sum(len(v) for v in arrivals.values()):,}"
+        )
+    print(f"service_calendar   = {len(static.get('service_calendar', {})):,}")
+    print(f"service_exceptions = {len(static.get('service_exceptions', {})):,}")
+    print(f"trip_service       = {len(static.get('trip_service', {})):,}")
 
 
 def sanity_check_against_hot_table(static: dict[str, Any], table_name: str) -> None:

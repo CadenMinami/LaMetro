@@ -7,6 +7,7 @@ import { StorageStack } from '../lib/storage-stack';
 import { ProcessingStack } from '../lib/processing-stack';
 import { ApiStack } from '../lib/api-stack';
 import { FrontendStack } from '../lib/frontend-stack';
+import { WebSocketStack } from '../lib/websocket-stack';
 
 const app = new cdk.App();
 
@@ -57,6 +58,12 @@ const frontend = new FrontendStack(app, 'LaMetro-FrontendStack', {
   description: 'Phase 3 frontend: S3 + CloudFront serving the Next.js static export.',
 });
 
+const websocket = new WebSocketStack(app, 'LaMetro-WebSocketStack', {
+  env,
+  connectionsTable: storage.websocketConnectionsTable,
+  description: 'Phase 5a: WebSocket API + connection manager Lambda.',
+});
+
 // Billing alarms must live in us-east-1 — that's the only region where AWS
 // publishes the AWS/Billing EstimatedCharges metric.
 const billing = new BillingStack(app, 'LaMetro-BillingStack', {
@@ -67,7 +74,7 @@ const billing = new BillingStack(app, 'LaMetro-BillingStack', {
   description: 'Cost guardrails: SNS-backed CloudWatch billing alarms + monthly Budget.',
 });
 
-for (const stack of [storage, ingestion, processing, api, frontend, billing]) {
+for (const stack of [storage, ingestion, processing, api, frontend, websocket, billing]) {
   for (const [k, v] of Object.entries(tags)) {
     cdk.Tags.of(stack).add(k, v);
   }
