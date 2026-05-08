@@ -1,4 +1,5 @@
 import type { Vehicle, VehiclesResponse } from '@/types/vehicle';
+import type { StopsResponse, StopArrivalsResponse } from '@/types/stop';
 import { SAMPLE_VEHICLES } from './sample-vehicles';
 
 export interface BBox {
@@ -58,4 +59,36 @@ export async function fetchRouteAggregates(
   if (!res.ok) throw new Error(`API ${res.status}`);
   const body = (await res.json()) as RouteAggregatesResponse;
   return body.windows ?? [];
+}
+
+// Phase 4d — stops + arrivals
+
+export async function fetchStops(signal?: AbortSignal): Promise<StopsResponse | null> {
+  const base = apiBase();
+  if (!base) return null;
+  const res = await fetch(`${base}/stops`, { signal, cache: 'force-cache' });
+  if (!res.ok) throw new Error(`API ${res.status}`);
+  return (await res.json()) as StopsResponse;
+}
+
+export interface FetchArrivalsOptions {
+  limit?: number;
+  horizonMinutes?: number;
+  signal?: AbortSignal;
+}
+
+export async function fetchStopArrivals(
+  stopId: string,
+  opts: FetchArrivalsOptions = {},
+): Promise<StopArrivalsResponse> {
+  const base = apiBase();
+  if (!base) throw new Error('NEXT_PUBLIC_API_BASE_URL not set');
+  const params = new URLSearchParams();
+  if (opts.limit) params.set('limit', String(opts.limit));
+  if (opts.horizonMinutes) params.set('horizon_minutes', String(opts.horizonMinutes));
+  const qs = params.toString();
+  const url = `${base}/stops/${encodeURIComponent(stopId)}/arrivals${qs ? `?${qs}` : ''}`;
+  const res = await fetch(url, { signal: opts.signal, cache: 'no-store' });
+  if (!res.ok) throw new Error(`API ${res.status}`);
+  return (await res.json()) as StopArrivalsResponse;
 }

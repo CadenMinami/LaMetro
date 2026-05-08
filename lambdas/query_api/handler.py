@@ -10,17 +10,28 @@ Endpoints:
         Returns recent 5-min-bucket aggregates for one route. Newest first.
         Drives the route detail page in the dashboard.
 
+    GET /stops
+        Returns the agency's full stops list (lightweight: id/name/lat/lon
+        + the route_ids that visit each). Frontend caches per session.
+
+    GET /stops/{stopId}/arrivals?[limit=N&horizon_minutes=M]
+        Returns the next N scheduled arrivals at this stop, with live vehicle
+        matched by trip_id when available. predicted_arrival folds in any
+        delay_seconds the enrichment Lambda has set.
+
 API Gateway dispatches based on `event['resource']`. Path params arrive in
 `event['pathParameters']`; query params in `event['queryStringParameters']`.
 """
 
 from __future__ import annotations
 
+import datetime as dt
 import json
 import logging
 import os
 from decimal import Decimal
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import boto3
 from boto3.dynamodb.conditions import Key
@@ -31,16 +42,54 @@ logger.setLevel(logging.INFO)
 HOT_TABLE_NAME = os.environ.get("HOT_VEHICLES_TABLE_NAME", "")
 AGG_TABLE_NAME = os.environ.get("ROUTE_AGGREGATES_TABLE_NAME", "")
 GEOHASH_PRECISION = int(os.environ.get("GEOHASH_PRECISION", "6"))
+GTFS_STATIC_BUCKET = os.environ.get("GTFS_STATIC_BUCKET", "")
+GTFS_STATIC_POINTER_KEY = os.environ.get("GTFS_STATIC_POINTER_KEY", "gtfs-static/current.txt")
+HOT_VEHICLES_ROUTE_GSI = os.environ.get("HOT_VEHICLES_ROUTE_GSI", "route_id-last_updated-index")
 DEFAULT_LIMIT = 500
 MAX_LIMIT = 1000
 MAX_BBOX_DEG2 = 0.5
 DEFAULT_AGG_LIMIT = 288  # 24h of 5-min buckets
+
+# Arrivals API tuning. The horizon is the wall-clock window we scan forward;
+# the per-route GSI page size caps how many recent live vehicles we consider
+# per route (more than enough — at most a few dozen per route at any moment).
+DEFAULT_ARRIVAL_LIMIT = 5
+MAX_ARRIVAL_LIMIT = 20
+DEFAULT_HORIZON_MINUTES = 60
+MIN_HORIZON_MINUTES = 5
+MAX_HORIZON_MINUTES = 180
+GSI_PAGE_SIZE = 50
+
+# LA Metro is, well, in LA. ZoneInfo handles DST automatically — the Lambda
+# build adds the `tzdata` package so this never falls back to UTC at runtime.
+_LA_TZ = ZoneInfo("America/Los_Angeles")
 
 GEOHASH_BASE32 = "0123456789bcdefghjkmnpqrstuvwxyz"
 
 _dynamodb = None
 _hot_table = None
 _agg_table = None
+_gtfs_static = None
+
+
+def _gtfs():
+    """Lazy-load the parsed GTFS static pickle once per cold start.
+
+    Imports `lambdas.shared.gtfs_static` lazily because that module pulls in
+    boto3 and (when shapes=True) shapely; keeping the import inside the
+    function means a /vehicles request never pays the cost.
+    """
+    global _gtfs_static
+    if _gtfs_static is None:
+        if not GTFS_STATIC_BUCKET:
+            raise RuntimeError("GTFS_STATIC_BUCKET env var not set")
+        from lambdas.shared.gtfs_static import load_from_s3
+        _gtfs_static = load_from_s3(
+            GTFS_STATIC_BUCKET,
+            GTFS_STATIC_POINTER_KEY,
+            shapes=False,  # arrivals API doesn't need geometry
+        )
+    return _gtfs_static
 
 
 def _hot():
@@ -262,6 +311,182 @@ def handle_route_aggregates(event: dict[str, Any]) -> dict:
     return _response(200, {"route_id": route_id, "count": len(windows), "windows": windows})
 
 
+def _routes_per_stop(static) -> dict[str, list[str]]:
+    """Pivot stop_arrivals into a stable {stop_id: [route_id, ...]} mapping.
+
+    Cached on the static object after first build so repeat /stops calls in
+    the same warm container don't re-walk ~2M arrival rows. Stop_arrivals
+    rarely changes within a session, and the result is ~13k stops × a few
+    routes each.
+    """
+    cached = getattr(static, "_routes_per_stop", None)
+    if cached is not None:
+        return cached
+    out: dict[str, list[str]] = {}
+    for stop_id, rows in static.stop_arrivals.items():
+        seen: set[str] = set()
+        ordered: list[str] = []
+        for _trip_id, route_id, _arr_s, _seq in rows:
+            if route_id and route_id not in seen:
+                seen.add(route_id)
+                ordered.append(route_id)
+        out[stop_id] = ordered
+    # Stash on the static object — frozen=False on GTFSStatic so this is fine.
+    try:
+        object.__setattr__(static, "_routes_per_stop", out)
+    except Exception:
+        pass
+    return out
+
+
+def handle_list_stops(event: dict[str, Any]) -> dict:
+    """GET /stops — full agency stops list. Cacheable per feed_version."""
+    try:
+        static = _gtfs()
+    except Exception:
+        logger.exception("gtfs_load_failed")
+        return _response(503, {"error": "gtfs_unavailable"})
+
+    routes_per_stop = _routes_per_stop(static)
+    payload: list[dict[str, Any]] = []
+    for stop_id, meta in static.stops.items():
+        payload.append({
+            "id": stop_id,
+            "name": meta.get("name", ""),
+            "lat": meta.get("lat"),
+            "lon": meta.get("lon"),
+            "routes": routes_per_stop.get(stop_id, []),
+        })
+    return _response(200, {
+        "version": static.feed_version,
+        "count": len(payload),
+        "stops": payload,
+    })
+
+
+def _iso_z(when: dt.datetime) -> str:
+    """ISO-8601 with trailing Z, in UTC. Matches what the rest of the API uses."""
+    return when.astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _live_vehicles_for_routes(table, route_ids: set[str]) -> dict[str, dict[str, Any]]:
+    """Fan-out the route_id GSI for each route. Returns {trip_id: latest_item}."""
+    by_trip: dict[str, dict[str, Any]] = {}
+    for route_id in route_ids:
+        if not route_id:
+            continue
+        resp = table.query(
+            IndexName=HOT_VEHICLES_ROUTE_GSI,
+            KeyConditionExpression=Key("route_id").eq(route_id),
+            ScanIndexForward=False,  # newest last_updated first
+            Limit=GSI_PAGE_SIZE,
+        )
+        for item in resp.get("Items", []):
+            trip_id = item.get("trip_id") or ""
+            if not trip_id:
+                continue
+            existing = by_trip.get(trip_id)
+            # Keep the freshest item per trip — same vehicle's stale rows can
+            # appear in the index until TTL fires.
+            if existing and (existing.get("last_updated") or "") >= (item.get("last_updated") or ""):
+                continue
+            by_trip[trip_id] = item
+    return by_trip
+
+
+def handle_stop_arrivals(event: dict[str, Any]) -> dict:
+    """GET /stops/{stopId}/arrivals — top-N upcoming arrivals at one stop."""
+    path_params = event.get("pathParameters") or {}
+    stop_id = path_params.get("stopId") or ""
+    if not stop_id:
+        return _response(400, {"error": "missing_stop_id"})
+
+    qs = event.get("queryStringParameters") or {}
+    try:
+        limit = int(qs.get("limit", DEFAULT_ARRIVAL_LIMIT))
+    except (TypeError, ValueError):
+        limit = DEFAULT_ARRIVAL_LIMIT
+    limit = max(1, min(limit, MAX_ARRIVAL_LIMIT))
+
+    try:
+        horizon_minutes = int(qs.get("horizon_minutes", DEFAULT_HORIZON_MINUTES))
+    except (TypeError, ValueError):
+        return _response(400, {"error": "invalid_horizon"})
+    if horizon_minutes < MIN_HORIZON_MINUTES or horizon_minutes > MAX_HORIZON_MINUTES:
+        return _response(400, {"error": "invalid_horizon"})
+
+    try:
+        static = _gtfs()
+    except Exception:
+        logger.exception("gtfs_load_failed")
+        return _response(503, {"error": "gtfs_unavailable"})
+
+    if stop_id not in static.stops:
+        return _response(404, {"error": "stop_not_found", "stop_id": stop_id})
+
+    now_utc = dt.datetime.now(dt.timezone.utc)
+    now_local = now_utc.astimezone(_LA_TZ)
+    horizon_seconds = horizon_minutes * 60
+
+    candidates = static.arrivals_for_stop(stop_id, now_local, horizon_seconds)
+
+    routes_needed = {a.route_id for a in candidates if a.route_id}
+    live_by_trip = _live_vehicles_for_routes(_hot(), routes_needed) if routes_needed else {}
+
+    arrivals_out: list[dict[str, Any]] = []
+    for arr in candidates:
+        wall_scheduled = static.absolute_arrival_time(arr, _LA_TZ)
+        live = live_by_trip.get(arr.trip_id)
+        delay_seconds: int | None = None
+        vehicle_id: str | None = None
+        if live is not None:
+            vehicle_id = live.get("vehicle_id") or None
+            raw_delay = live.get("delay_seconds")
+            if isinstance(raw_delay, Decimal):
+                delay_seconds = int(raw_delay)
+            elif isinstance(raw_delay, (int, float)):
+                delay_seconds = int(raw_delay)
+
+        wall_predicted = wall_scheduled + dt.timedelta(seconds=delay_seconds or 0)
+        delta_seconds = (wall_predicted - now_utc).total_seconds()
+        # `due` = within the lookback window or about to arrive (<60s).
+        # `departed` = already passed (only possible inside lookback).
+        if live is not None:
+            if delta_seconds < 0:
+                status = "departed"
+            elif delta_seconds < 60:
+                status = "due"
+            else:
+                status = "live"
+        else:
+            status = "scheduled"
+
+        arrivals_out.append({
+            "route_id": arr.route_id,
+            "trip_id": arr.trip_id,
+            "scheduled_arrival": _iso_z(wall_scheduled),
+            "predicted_arrival": _iso_z(wall_predicted),
+            "predicted_minutes": int(delta_seconds // 60) if delta_seconds >= 0
+                                  else -int((-delta_seconds + 59) // 60),
+            "delay_seconds": delay_seconds,
+            "status": status,
+            "vehicle_id": vehicle_id,
+            "stop_sequence": arr.stop_sequence,
+        })
+
+    arrivals_out.sort(key=lambda a: a["predicted_arrival"])
+    arrivals_out = arrivals_out[:limit]
+
+    stop_meta = static.stops.get(stop_id, {})
+    return _response(200, {
+        "stop_id": stop_id,
+        "stop_name": stop_meta.get("name", ""),
+        "as_of": _iso_z(now_utc),
+        "horizon_minutes": horizon_minutes,
+        "arrivals": arrivals_out,
+    })
+
+
 def lambda_handler(event: dict[str, Any], context: Any) -> dict:
     """Dispatch based on the API Gateway resource path. Unknown paths 404."""
     resource = event.get("resource") or event.get("path") or ""
@@ -271,4 +496,8 @@ def lambda_handler(event: dict[str, Any], context: Any) -> dict:
         return handle_vehicles(event)
     if resource == "/routes/{routeId}/aggregates":
         return handle_route_aggregates(event)
+    if resource == "/stops":
+        return handle_list_stops(event)
+    if resource == "/stops/{stopId}/arrivals":
+        return handle_stop_arrivals(event)
     return _response(404, {"error": "not_found", "resource": resource})

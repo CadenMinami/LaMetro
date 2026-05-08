@@ -1,1 +1,5 @@
-# boto3 ships with the Lambda runtime — no external deps needed.
+# boto3 ships with the Lambda runtime — no external deps needed for it.
+# `tzdata` powers `zoneinfo.ZoneInfo("America/Los_Angeles")` for the arrivals
+# API. AWS Lambda's Amazon Linux runtime image doesn't bundle the IANA
+# database, so we ship a pure-Python copy alongside the function (~1MB).
+tzdata
