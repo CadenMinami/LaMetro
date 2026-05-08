@@ -1,12 +1,23 @@
 'use client';
 
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { fetchVehicles, type BBox } from '@/lib/api';
 import { delayColor, delayLabel, routeColor } from '@/lib/colors';
+import { getStops, indexStops, stopsInBBox } from '@/lib/stops';
 import type { Vehicle } from '@/types/vehicle';
+import type { Stop } from '@/types/stop';
+import { StopArrivalsPanel } from './StopArrivalsPanel';
 
 const LA_DOWNTOWN: [number, number] = [-118.2437, 34.0522];
 const POLL_MS = 30_000;
+// Below this zoom, rendering ~13k stop graphics tanks ArcGIS' GraphicsLayer.
+// 13 is roughly "you can see individual streets" — matches Google Maps'
+// transit-stop visibility heuristic.
+const STOPS_MIN_ZOOM = 13;
+// Cap the number of stops rendered at any one time. The bbox at zoom 13
+// covers a few hundred stops in dense LA neighborhoods; beyond that you
+// can't tell them apart visually anyway.
+const MAX_STOPS_RENDERED = 1500;
 
 // Fallback bbox used before the MapView is ready. ~25km × 25km around
 // downtown — well under the API's 50km × 50km cap (see API_CONTRACT.md).
@@ -21,12 +32,19 @@ export function MetroMap() {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const viewRef = useRef<__esri.MapView | null>(null);
   const layerRef = useRef<__esri.GraphicsLayer | null>(null);
+  const stopsLayerRef = useRef<__esri.GraphicsLayer | null>(null);
   const graphicCtorRef = useRef<typeof import('@arcgis/core/Graphic').default | null>(null);
   const projectRef = useRef<
     typeof import('@arcgis/core/geometry/support/webMercatorUtils').webMercatorToGeographic | null
   >(null);
+  // The full agency stops list, fetched once. Held in a ref because every
+  // viewport change re-derives the visible subset — re-rendering React on
+  // each pan would be wasteful.
+  const stopsRef = useRef<Stop[] | null>(null);
+  const stopsIndexRef = useRef<Map<string, Stop> | null>(null);
   const [count, setCount] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [selectedStopId, setSelectedStopId] = useState<string | null>(null);
 
   // Init the map once on mount. ArcGIS modules are imported here rather than
   // at module top so they only load in the browser, not at static-export build.
@@ -52,8 +70,11 @@ export function MetroMap() {
 
       if (cancelled || !containerRef.current) return;
 
-      const layer = new GraphicsLayer();
-      const map = new Map({ basemap: 'dark-gray-vector', layers: [layer] });
+      // Two layers: stops underneath, vehicles on top. Vehicles have higher
+      // information density and should always win z-order ties on click.
+      const stopsLayer = new GraphicsLayer({ id: 'stops', visible: false });
+      const layer = new GraphicsLayer({ id: 'vehicles' });
+      const map = new Map({ basemap: 'dark-gray-vector', layers: [stopsLayer, layer] });
       const view = new MapView({
         container: containerRef.current,
         map,
@@ -63,8 +84,35 @@ export function MetroMap() {
 
       viewRef.current = view;
       layerRef.current = layer;
+      stopsLayerRef.current = stopsLayer;
       graphicCtorRef.current = Graphic;
       projectRef.current = webMercatorToGeographic;
+
+      // Click handler: hit-test stops first (they're smaller and easier to
+      // miss), fall through to vehicles' default popup. We don't use a
+      // popupTemplate on the stop graphic — the side panel is a richer
+      // experience than the ArcGIS popup for a polling list.
+      view.on('click', async (event) => {
+        const hit = await view.hitTest(event, { include: stopsLayer });
+        const stopHit = hit.results.find(
+          (r) => r.type === 'graphic' && (r as __esri.GraphicHit).graphic.layer === stopsLayer,
+        ) as __esri.GraphicHit | undefined;
+        if (stopHit) {
+          const stopId = stopHit.graphic.attributes?.stop_id as string | undefined;
+          if (stopId) {
+            // Stop the click from also opening a vehicle popup that may
+            // sit underneath the stop dot.
+            event.stopPropagation();
+            setSelectedStopId(stopId);
+          }
+        }
+      });
+
+      // Re-render stops on viewport stability. `stationary` flips true
+      // ~150ms after pan/zoom ends; cheaper than per-frame rendering.
+      view.watch('stationary', (stationary: boolean) => {
+        if (stationary) renderStops();
+      });
     })();
 
     return () => {
@@ -72,7 +120,93 @@ export function MetroMap() {
       viewRef.current?.destroy();
       viewRef.current = null;
       layerRef.current = null;
+      stopsLayerRef.current = null;
     };
+    // renderStops is stable — defined below as useCallback with no deps
+    // beyond refs. Including it in deps would re-init the map on every
+    // render, which is wrong.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Hydrate the stops list once. Cheap re-runs are guarded by the cache in
+  // lib/stops.ts.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const stops = await getStops();
+        if (cancelled) return;
+        stopsRef.current = stops;
+        stopsIndexRef.current = indexStops(stops);
+        renderStops();
+      } catch (err) {
+        // Stops failure shouldn't kill the map — just log and skip the
+        // feature. Vehicles still work.
+        console.warn('fetchStops failed:', err);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const renderStops = useCallback(() => {
+    const view = viewRef.current;
+    const layer = stopsLayerRef.current;
+    const Graphic = graphicCtorRef.current;
+    const stops = stopsRef.current;
+    if (!view || !layer || !Graphic || !stops) return;
+
+    if (view.zoom < STOPS_MIN_ZOOM) {
+      if (layer.visible) {
+        layer.removeAll();
+        layer.visible = false;
+      }
+      return;
+    }
+
+    const ext = view.extent;
+    const project = projectRef.current;
+    if (!ext || !project) return;
+    const geo = project(ext) as __esri.Extent;
+    const visible = stopsInBBox(stops, geo.ymin, geo.xmin, geo.ymax, geo.xmax);
+    const slice = visible.slice(0, MAX_STOPS_RENDERED);
+
+    layer.removeAll();
+    for (const s of slice) {
+      // Color by the first route that visits this stop. Multi-route stops
+      // get whichever route_id sorts first — good enough as a hint, the
+      // panel shows the full list when the user clicks.
+      const tint = s.routes[0] ? routeColor(s.routes[0]) : '#9ca3af';
+      // Larger transparent hit graphic underneath gives a 12px touch target
+      // even though the visible dot is only 5px.
+      layer.add(
+        new Graphic({
+          geometry: { type: 'point', longitude: s.lon, latitude: s.lat },
+          symbol: {
+            type: 'simple-marker',
+            color: [0, 0, 0, 0],
+            size: 12,
+            outline: { color: [0, 0, 0, 0], width: 0 },
+          },
+          attributes: { stop_id: s.id },
+        }),
+      );
+      layer.add(
+        new Graphic({
+          geometry: { type: 'point', longitude: s.lon, latitude: s.lat },
+          symbol: {
+            type: 'simple-marker',
+            color: tint,
+            size: 5,
+            outline: { color: '#0b0d10', width: 1 },
+          },
+          attributes: { stop_id: s.id },
+        }),
+      );
+    }
+    layer.visible = true;
   }, []);
 
   // Poll every 30s. Each tick re-derives the bbox from the current viewport
@@ -160,6 +294,19 @@ export function MetroMap() {
     }
   }
 
+  // ESC key closes the panel. Lives in its own effect so the listener
+  // attaches/detaches based on `selectedStopId` rather than mount.
+  useEffect(() => {
+    if (!selectedStopId) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setSelectedStopId(null);
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [selectedStopId]);
+
+  const selectedStop = selectedStopId ? stopsIndexRef.current?.get(selectedStopId) ?? null : null;
+
   return (
     <div className="relative h-screen w-screen">
       <div ref={containerRef} className="h-full w-full" />
@@ -170,6 +317,13 @@ export function MetroMap() {
         </div>
         {error && <div className="text-red-400">err: {error}</div>}
       </div>
+      {selectedStopId && (
+        <StopArrivalsPanel
+          stopId={selectedStopId}
+          stop={selectedStop}
+          onClose={() => setSelectedStopId(null)}
+        />
+      )}
     </div>
   );
 }
