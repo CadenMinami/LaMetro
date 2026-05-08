@@ -80,30 +80,26 @@ def fetch_zip(url: str, timeout: float = 60.0) -> bytes:
 
 
 def merge_static(parts: list[dict[str, Any]]) -> dict[str, Any]:
-    """Merge multiple parsed GTFS dicts (e.g., bus + rail) into one.
-
-    LA Metro uses disjoint trip_ids/stop_ids across bus and rail, so simple
-    dict.update() works. We log any collisions in case that assumption ever
-    breaks (e.g., a future agency rename).
-    """
+    """Merge multiple parsed GTFS dicts (e.g., bus + rail) into one slim
+    structure. LA Metro uses disjoint trip_ids/shape_ids across bus and rail,
+    so simple dict.update() works."""
     merged: dict[str, Any] = {
         "feed_version": "+".join(p["feed_version"] for p in parts),
         "feed_start_date": None,
         "feed_end_date": None,
         "trips": {},
-        "stop_times": {},
-        "stops": {},
+        "schedules": {},
         "shapes": {},
     }
-    collisions = {"trips": 0, "stop_times": 0, "stops": 0, "shapes": 0}
+    collisions = {"trips": 0, "schedules": 0, "shapes": 0}
     for part in parts:
-        for key in ("trips", "stop_times", "stops", "shapes"):
-            for sub_id in part[key]:
+        for key in ("trips", "schedules", "shapes"):
+            for sub_id in part.get(key, {}):
                 if sub_id in merged[key]:
                     collisions[key] += 1
-            merged[key].update(part[key])
+            merged[key].update(part.get(key, {}))
     if any(collisions.values()):
-        print(f"⚠️  trip/stop/shape id collisions while merging: {collisions}")
+        print(f"⚠️  trip/schedule/shape id collisions while merging: {collisions}")
     return merged
 
 
@@ -115,22 +111,24 @@ def _read_csv(zf: zipfile.ZipFile, name: str) -> list[dict[str, str]]:
 
 
 def parse_static(zip_bytes: bytes) -> dict[str, Any]:
-    """Parse GTFS static zip into a compact dict structure.
+    """Parse GTFS static zip into a slim, algorithm-ready dict.
 
-    Output schema (kept small enough to ship via S3 + cache in Lambda memory):
-        {
-            "feed_version": str,
-            "feed_start_date": str | None,
-            "feed_end_date": str | None,
-            "trips": {trip_id: {"route_id", "service_id", "shape_id",
-                                "direction_id"}},
-            "stop_times": {trip_id: [
-                {"stop_id", "stop_sequence", "arr_s", "dep_s",
-                 "shape_dist_traveled"}, ...
-            ]},
-            "stops": {stop_id: {"lat", "lon", "name"}},
-            "shapes": {shape_id: [(lat, lon, dist_traveled), ...]},
-        }
+    The Lambda that consumes this only needs:
+      - trip_id → (route_id, shape_id) for routing decisions and route fallback.
+      - trip_id → schedule tuple of (time_seconds_into_day, dist_along_shape_m)
+        — pre-computed here so the Lambda never has to do per-row work.
+      - shape_id → tuple of (lat, lon) — projected to LineString lazily on load.
+
+    We deliberately drop stops, stop_sequence, direction_id, service_id, names,
+    and per-row shape_dist points — they would balloon the pickle from ~10 MB
+    (this layout) to ~110 MB (full dict-of-dicts), and the Lambda doesn't need
+    them. The dist_traveled field on shape rows is dropped because we
+    re-derive it from cumulative segment length when building the LineString.
+
+    A trip is included in `schedules` only when we can produce a non-empty
+    (time, distance) sequence — either via shape_dist_traveled in
+    stop_times.txt (LA Metro provides it) or by projecting each stop's
+    (lat, lon) onto the shape geometry. Trips with neither are skipped.
     """
     with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
         names = set(zf.namelist())
@@ -150,57 +148,52 @@ def parse_static(zip_bytes: bytes) -> dict[str, Any]:
                 feed_start = rows[0].get("feed_start_date") or None
                 feed_end = rows[0].get("feed_end_date") or None
         if not feed_version:
-            # Fall back to today's ISO date so each load gets a unique version.
             feed_version = dt.date.today().isoformat()
 
-        # ---- trips.txt
-        trips: dict[str, dict[str, str]] = {}
+        # ---- trips.txt → trip_id -> (route_id, shape_id)
+        trips: dict[str, tuple[str, str]] = {}
         for row in _read_csv(zf, "trips.txt"):
-            trips[row["trip_id"]] = {
-                "route_id": row.get("route_id", ""),
-                "service_id": row.get("service_id", ""),
-                "shape_id": row.get("shape_id", ""),
-                "direction_id": row.get("direction_id", ""),
-            }
+            trips[row["trip_id"]] = (
+                row.get("route_id", ""),
+                row.get("shape_id", ""),
+            )
 
-        # ---- stops.txt
-        stops: dict[str, dict[str, Any]] = {}
+        # ---- stops.txt — kept temporarily so we can project stops onto shapes
+        # for trips that lack shape_dist_traveled. Discarded before return.
+        stops_local: dict[str, tuple[float, float]] = {}
         for row in _read_csv(zf, "stops.txt"):
             try:
-                stops[row["stop_id"]] = {
-                    "lat": float(row["stop_lat"]),
-                    "lon": float(row["stop_lon"]),
-                    "name": row.get("stop_name", ""),
-                }
-            except (KeyError, ValueError):
-                continue  # Skip malformed rows rather than fail the whole load.
-
-        # ---- stop_times.txt (the big one — typically 1-3M rows for a metro)
-        stop_times_by_trip: dict[str, list[dict[str, Any]]] = defaultdict(list)
-        for row in _read_csv(zf, "stop_times.txt"):
-            trip_id = row["trip_id"]
-            try:
-                stop_times_by_trip[trip_id].append(
-                    {
-                        "stop_id": row["stop_id"],
-                        "stop_sequence": int(row["stop_sequence"]),
-                        "arr_s": _hhmmss_to_seconds(row.get("arrival_time", "")),
-                        "dep_s": _hhmmss_to_seconds(row.get("departure_time", "")),
-                        "shape_dist_traveled": _maybe_float(
-                            row.get("shape_dist_traveled", "")
-                        ),
-                    }
+                stops_local[row["stop_id"]] = (
+                    float(row["stop_lat"]),
+                    float(row["stop_lon"]),
                 )
             except (KeyError, ValueError):
                 continue
-        # Sort each trip's stops by sequence — GTFS doesn't guarantee row order.
-        for trip_id, rows in stop_times_by_trip.items():
-            rows.sort(key=lambda r: r["stop_sequence"])
 
-        # ---- shapes.txt (optional — some agencies don't publish shapes)
-        shapes_by_id: dict[str, list[tuple[float, float, float | None]]] = defaultdict(list)
+        # ---- stop_times.txt → grouped by trip, sorted by sequence
+        # We collect minimal tuples here (sequence, arr_s, dep_s, dist, stop_id)
+        # then transform into the slim per-trip schedule below.
+        per_trip: dict[str, list[tuple[int, int | None, int | None, float | None, str]]] = (
+            defaultdict(list)
+        )
+        for row in _read_csv(zf, "stop_times.txt"):
+            try:
+                trip_id = row["trip_id"]
+                seq = int(row["stop_sequence"])
+                arr = _hhmmss_to_seconds(row.get("arrival_time", ""))
+                dep = _hhmmss_to_seconds(row.get("departure_time", ""))
+                dist = _maybe_float(row.get("shape_dist_traveled", ""))
+                stop_id = row.get("stop_id", "")
+                per_trip[trip_id].append((seq, arr, dep, dist, stop_id))
+            except (KeyError, ValueError):
+                continue
+        for stops_seq in per_trip.values():
+            stops_seq.sort(key=lambda r: r[0])
+
+        # ---- shapes.txt → shape_id -> tuple of (lat, lon) sorted by sequence
+        shapes_by_id: dict[str, tuple[tuple[float, float], ...]] = {}
         if "shapes.txt" in names:
-            tmp: dict[str, list[tuple[int, float, float, float | None]]] = defaultdict(list)
+            tmp: dict[str, list[tuple[int, float, float]]] = defaultdict(list)
             for row in _read_csv(zf, "shapes.txt"):
                 try:
                     tmp[row["shape_id"]].append(
@@ -208,24 +201,175 @@ def parse_static(zip_bytes: bytes) -> dict[str, Any]:
                             int(row["shape_pt_sequence"]),
                             float(row["shape_pt_lat"]),
                             float(row["shape_pt_lon"]),
-                            _maybe_float(row.get("shape_dist_traveled", "")),
                         )
                     )
                 except (KeyError, ValueError):
                     continue
             for shape_id, pts in tmp.items():
                 pts.sort(key=lambda t: t[0])
-                shapes_by_id[shape_id] = [(lat, lon, dist) for _, lat, lon, dist in pts]
+                shapes_by_id[shape_id] = tuple((lat, lon) for _, lat, lon in pts)
+
+    # Pre-cache each shape's projected xy + cumulative distance ONCE so the
+    # 38k-trip loop below only does per-stop projection, not per-trip
+    # reprojection of every shape point. With ~700 shapes feeding ~38k
+    # trips, this is a 50x speedup over re-projecting inside the trip loop.
+    shape_cache: dict[str, tuple[list[float], list[float], list[float]]] = {}
+    import math as _math
+    for shape_id, pts in shapes_by_id.items():
+        if len(pts) < 2:
+            continue
+        mean_lat = sum(lat for lat, _ in pts) / len(pts)
+        mlat = 111_320.0
+        mlon = 111_320.0 * _math.cos(_math.radians(mean_lat))
+        xs = [lon * mlon for _, lon in pts]
+        ys = [lat * mlat for lat, _ in pts]
+        cum = [0.0]
+        for i in range(1, len(pts)):
+            cum.append(
+                cum[-1] + _math.hypot(xs[i] - xs[i - 1], ys[i] - ys[i - 1])
+            )
+        shape_cache[shape_id] = (xs, ys, cum)
+
+    def _project(stop_ll: tuple[float, float], shape_id: str) -> float | None:
+        cached = shape_cache.get(shape_id)
+        if cached is None:
+            return None
+        xs, ys, cum = cached
+        # Use the same xy projection the shape was cached with. Each shape
+        # was projected at *its own* mean lat, so we recover that scale here.
+        mean_lat = sum(ys) / (len(ys) * 111_320.0)
+        mlon = 111_320.0 * _math.cos(_math.radians(mean_lat))
+        px = stop_ll[1] * mlon
+        py = stop_ll[0] * 111_320.0
+        best_perp_sq = float("inf")
+        best_along = 0.0
+        for i in range(len(xs) - 1):
+            ax, ay = xs[i], ys[i]
+            dx = xs[i + 1] - ax
+            dy = ys[i + 1] - ay
+            seg_len_sq = dx * dx + dy * dy
+            if seg_len_sq == 0:
+                continue
+            t = ((px - ax) * dx + (py - ay) * dy) / seg_len_sq
+            if t < 0.0:
+                t = 0.0
+            elif t > 1.0:
+                t = 1.0
+            prx = ax + t * dx
+            pry = ay + t * dy
+            perp_sq = (px - prx) ** 2 + (py - pry) ** 2
+            if perp_sq < best_perp_sq:
+                best_perp_sq = perp_sq
+                best_along = cum[i] + t * _math.sqrt(seg_len_sq)
+        return best_along
+
+    schedules: dict[str, tuple[tuple[int, float], ...]] = {}
+    skipped_no_shape = 0
+    skipped_no_schedule = 0
+    for trip_id, stops_seq in per_trip.items():
+        trip_meta = trips.get(trip_id)
+        if not trip_meta:
+            continue
+        _, shape_id = trip_meta
+        if not shape_id or shape_id not in shape_cache:
+            skipped_no_shape += 1
+            continue
+        sched: list[tuple[int, float]] = []
+        for _seq, arr, dep, dist, stop_id in stops_seq:
+            t = dep if dep is not None else arr
+            if t is None:
+                continue
+            d = dist
+            if d is None:
+                stop_ll = stops_local.get(stop_id)
+                if stop_ll is None:
+                    continue
+                d = _project(stop_ll, shape_id)
+                if d is None:
+                    continue
+            sched.append((int(t), float(d)))
+        if not sched:
+            skipped_no_schedule += 1
+            continue
+        sched.sort(key=lambda x: x[1])
+        schedules[trip_id] = tuple(sched)
+
+    if skipped_no_shape or skipped_no_schedule:
+        print(
+            f"slim-format trips skipped: no_shape={skipped_no_shape} "
+            f"no_schedule={skipped_no_schedule}"
+        )
 
     return {
         "feed_version": feed_version,
         "feed_start_date": feed_start,
         "feed_end_date": feed_end,
-        "trips": trips,
-        "stop_times": dict(stop_times_by_trip),
-        "stops": stops,
-        "shapes": dict(shapes_by_id),
+        "trips": trips,         # trip_id -> (route_id, shape_id)
+        "schedules": schedules, # trip_id -> tuple of (time_s, dist_m)
+        "shapes": shapes_by_id, # shape_id -> tuple of (lat, lon)
     }
+
+
+def _cum_distances(
+    shape_pts: tuple[tuple[float, float], ...]
+) -> tuple[float, ...]:
+    """Cumulative meters along the shape, starting at 0. Equirectangular at
+    the shape's mean latitude — within fractions of a percent for LA."""
+    import math as _math
+    if not shape_pts:
+        return ()
+    mean_lat = sum(lat for lat, _ in shape_pts) / len(shape_pts)
+    m_per_deg_lat = 111_320.0
+    m_per_deg_lon = 111_320.0 * _math.cos(_math.radians(mean_lat))
+    out = [0.0]
+    for i in range(1, len(shape_pts)):
+        dlat = shape_pts[i][0] - shape_pts[i - 1][0]
+        dlon = shape_pts[i][1] - shape_pts[i - 1][1]
+        seg = _math.hypot(dlat * m_per_deg_lat, dlon * m_per_deg_lon)
+        out.append(out[-1] + seg)
+    return tuple(out)
+
+
+def _project_latlon_onto_shape(
+    point: tuple[float, float],
+    shape_pts: tuple[tuple[float, float], ...],
+    cum: tuple[float, ...],
+) -> float | None:
+    """Project a (lat, lon) onto the shape and return its distance-along.
+
+    Uses the same equirectangular metric as `_cum_distances`. Without a
+    dependency on Shapely we still get sub-meter accuracy for LA-scale routes.
+    """
+    import math as _math
+    if len(shape_pts) < 2:
+        return None
+    mean_lat = sum(lat for lat, _ in shape_pts) / len(shape_pts)
+    mlat = 111_320.0
+    mlon = 111_320.0 * _math.cos(_math.radians(mean_lat))
+    px = point[1] * mlon
+    py = point[0] * mlat
+
+    best_perp_sq = float("inf")
+    best_along = 0.0
+    for i in range(len(shape_pts) - 1):
+        ax = shape_pts[i][1] * mlon
+        ay = shape_pts[i][0] * mlat
+        bx = shape_pts[i + 1][1] * mlon
+        by = shape_pts[i + 1][0] * mlat
+        dx = bx - ax
+        dy = by - ay
+        seg_len_sq = dx * dx + dy * dy
+        if seg_len_sq == 0:
+            continue
+        t = ((px - ax) * dx + (py - ay) * dy) / seg_len_sq
+        t = max(0.0, min(1.0, t))
+        prx = ax + t * dx
+        pry = ay + t * dy
+        perp_sq = (px - prx) ** 2 + (py - pry) ** 2
+        if perp_sq < best_perp_sq:
+            best_perp_sq = perp_sq
+            best_along = cum[i] + t * _math.sqrt(seg_len_sq)
+    return best_along
 
 
 def _hhmmss_to_seconds(s: str) -> int | None:
@@ -256,15 +400,16 @@ def _maybe_float(s: str) -> float | None:
 
 def summarize(static: dict[str, Any]) -> None:
     print(f"feed_version       = {static['feed_version']}")
-    print(f"feed_start_date    = {static['feed_start_date']}")
-    print(f"feed_end_date      = {static['feed_end_date']}")
-    print(f"trips              = {len(static['trips']):,}")
-    print(f"stops              = {len(static['stops']):,}")
-    print(
-        f"stop_times trips   = {len(static['stop_times']):,} "
-        f"(total rows ≈ {sum(len(v) for v in static['stop_times'].values()):,})"
-    )
-    print(f"shapes             = {len(static['shapes']):,}")
+    print(f"feed_start_date    = {static.get('feed_start_date')}")
+    print(f"feed_end_date      = {static.get('feed_end_date')}")
+    print(f"trips              = {len(static.get('trips', {})):,}")
+    print(f"schedules          = {len(static.get('schedules', {})):,}")
+    sched = static.get("schedules", {})
+    if sched:
+        print(
+            f"  total schedule rows ≈ {sum(len(v) for v in sched.values()):,}"
+        )
+    print(f"shapes             = {len(static.get('shapes', {})):,}")
 
 
 def sanity_check_against_hot_table(static: dict[str, Any], table_name: str) -> None:

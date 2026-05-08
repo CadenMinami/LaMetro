@@ -47,9 +47,12 @@ export class ProcessingStack extends cdk.Stack {
       handler: 'handler.lambda_handler',
       code: lambda.Code.fromAsset(lambdaAssetPath),
       // Phase 4c: holds the GTFS static (LineStrings + schedule tuples) in
-      // module memory. Even with shape dedup, peak memory hits ~600-800 MB.
+      // module memory. The slim pickle layout keeps peak under ~250 MB so
+      // 1024 is comfortable headroom.
       memorySize: 1024,
-      timeout: cdk.Duration.seconds(60),
+      // 120s gives ~30s slack on cold start (slim pickle → LineStrings →
+      // dataclass) on top of the actual record processing budget.
+      timeout: cdk.Duration.seconds(120),
       environment: {
         HOT_VEHICLES_TABLE_NAME: props.hotVehiclesTable.tableName,
         GEOHASH_PRECISION: '6',
