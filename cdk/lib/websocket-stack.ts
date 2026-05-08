@@ -4,6 +4,7 @@ import { Construct } from 'constructs';
 import * as lambda from 'aws-cdk-lib/aws-lambda';
 import * as logs from 'aws-cdk-lib/aws-logs';
 import * as dynamodb from 'aws-cdk-lib/aws-dynamodb';
+import * as iam from 'aws-cdk-lib/aws-iam';
 import * as apigwv2 from 'aws-cdk-lib/aws-apigatewayv2';
 import * as integrations from 'aws-cdk-lib/aws-apigatewayv2-integrations';
 
@@ -94,5 +95,26 @@ export class WebSocketStack extends cdk.Stack {
     new cdk.CfnOutput(this, 'WsClientUrl', { value: this.clientUrl });
     new cdk.CfnOutput(this, 'WsCallbackUrl', { value: this.callbackUrl });
     new cdk.CfnOutput(this, 'WsConnFnName', { value: wsConnFn.functionName });
+  }
+
+  /**
+   * Grant a principal permission to push messages to any open connection on
+   * this WebSocket API. Used by the enrichment Lambda for Phase 5b fan-out.
+   *
+   * The action `execute-api:ManageConnections` covers POST/DELETE on
+   * `@connections/<connection_id>`. Resource ARN scopes to this stage only.
+   */
+  public grantManageConnections(grantee: iam.IGrantable): iam.Grant {
+    return iam.Grant.addToPrincipal({
+      grantee,
+      actions: ['execute-api:ManageConnections'],
+      resourceArns: [
+        cdk.Stack.of(this).formatArn({
+          service: 'execute-api',
+          resource: this.api.apiId,
+          resourceName: `${this.stage.stageName}/POST/@connections/*`,
+        }),
+      ],
+    });
   }
 }

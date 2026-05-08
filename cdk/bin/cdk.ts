@@ -36,32 +36,39 @@ const ingestion = new IngestionStack(app, 'LaMetro-IngestionStack', {
   description: 'LA Metro GTFS-RT ingestion Lambda + EventBridge schedule.',
 });
 
+// WebSocketStack must be constructed *before* ProcessingStack so we can
+// pass the callback URL + grantManageConnections() into the enrichment
+// Lambda for Phase 5b fan-out.
+const websocket = new WebSocketStack(app, 'LaMetro-WebSocketStack', {
+  env,
+  connectionsTable: storage.websocketConnectionsTable,
+  description: 'Phase 5a: WebSocket API + connection manager Lambda.',
+});
+
 const processing = new ProcessingStack(app, 'LaMetro-ProcessingStack', {
   env,
   vehicleStream: storage.vehicleStream,
   hotVehiclesTable: storage.hotVehiclesTable,
   routeAggregatesTable: storage.routeAggregatesTable,
   archiveBucket: storage.archiveBucket,
+  websocketConnectionsTable: storage.websocketConnectionsTable,
+  websocketStack: websocket,
   description:
-    'Processing: Enrichment Lambda (Kinesis → DynamoDB + delay) + Aggregation (every 1m).',
+    'Processing: Enrichment (Kinesis → DDB + delay + WebSocket fan-out) + Aggregation (1m).',
 });
 
 const api = new ApiStack(app, 'LaMetro-ApiStack', {
   env,
   hotVehiclesTable: storage.hotVehiclesTable,
   routeAggregatesTable: storage.routeAggregatesTable,
-  description: 'Read API: GET /vehicles + GET /routes/{routeId}/aggregates.',
+  archiveBucket: storage.archiveBucket,
+  description:
+    'Read API: /vehicles, /routes/{id}/aggregates, /stops, /stops/{id}/arrivals.',
 });
 
 const frontend = new FrontendStack(app, 'LaMetro-FrontendStack', {
   env,
   description: 'Phase 3 frontend: S3 + CloudFront serving the Next.js static export.',
-});
-
-const websocket = new WebSocketStack(app, 'LaMetro-WebSocketStack', {
-  env,
-  connectionsTable: storage.websocketConnectionsTable,
-  description: 'Phase 5a: WebSocket API + connection manager Lambda.',
 });
 
 // Billing alarms must live in us-east-1 — that's the only region where AWS

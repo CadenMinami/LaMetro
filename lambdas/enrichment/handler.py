@@ -24,7 +24,7 @@ import boto3
 
 # Shared deviation algorithm — copied into this lambda's .build by the
 # build script. See scripts/build-lambda.sh for the layout.
-from lambdas.shared import deviation, gtfs_static
+from lambdas.shared import broadcast, deviation, gtfs_static
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -35,6 +35,11 @@ TTL_SECONDS = int(os.environ.get("HOT_VEHICLE_TTL_SECONDS", "3600"))
 GTFS_BUCKET = os.environ.get("GTFS_STATIC_BUCKET", "")
 GTFS_POINTER_KEY = os.environ.get("GTFS_STATIC_POINTER_KEY", "gtfs-static/current.txt")
 AGENCY_TZ = ZoneInfo(os.environ.get("AGENCY_TIMEZONE", "America/Los_Angeles"))
+# Phase 5b: WebSocket fan-out config. Empty values disable the broadcast
+# entirely — useful for local tests and for the case where the WebSocket
+# stack hasn't been deployed yet.
+WEBSOCKET_CALLBACK_URL = os.environ.get("WEBSOCKET_CALLBACK_URL", "")
+WEBSOCKET_CONNECTIONS_TABLE = os.environ.get("WEBSOCKET_CONNECTIONS_TABLE_NAME", "")
 
 _dynamodb = None
 _table = None
@@ -197,6 +202,9 @@ def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     skipped = 0
     errors = 0
     delays_computed = 0
+    # Hold onto the items we wrote so the WebSocket fan-out below can
+    # rebroadcast them. Cheap — items are already in memory.
+    fanout_items: list[dict[str, Any]] = []
 
     gtfs = get_gtfs()
     table = get_table()
@@ -211,10 +219,25 @@ def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
                 if "delay_seconds" in item:
                     delays_computed += 1
                 batch.put_item(Item=item)
+                fanout_items.append(item)
                 written += 1
             except Exception:
                 logger.exception("enrichment_record_failed")
                 errors += 1
+
+    # Phase 5b: fan out this batch to any matching WebSocket subscriber.
+    # Failures here are non-fatal — they shouldn't lose us DynamoDB writes
+    # we already committed.
+    fanout_summary: dict[str, int] = {"sent": 0, "stale": 0, "skipped": 0}
+    if fanout_items and WEBSOCKET_CALLBACK_URL and WEBSOCKET_CONNECTIONS_TABLE:
+        try:
+            fanout_summary = broadcast.fan_out(
+                fanout_items,
+                callback_url=WEBSOCKET_CALLBACK_URL,
+                connections_table=WEBSOCKET_CONNECTIONS_TABLE,
+            )
+        except Exception:
+            logger.exception("ws_fanout_failed")
 
     summary = {
         "ok": True,
@@ -224,6 +247,8 @@ def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
         "errors": errors,
         "delays_computed": delays_computed,
         "gtfs_loaded": gtfs is not None,
+        "ws_sent": fanout_summary["sent"],
+        "ws_stale": fanout_summary["stale"],
     }
     logger.info(json.dumps(summary))
     return summary
