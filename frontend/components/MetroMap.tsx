@@ -4,12 +4,21 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { fetchVehicles, type BBox } from '@/lib/api';
 import { delayColor, delayLabel, routeColor } from '@/lib/colors';
 import { getStops, indexStops, stopsInBBox } from '@/lib/stops';
+import { openVehicleSocket, type VehicleSocketHandle } from '@/lib/socket';
 import type { Vehicle } from '@/types/vehicle';
 import type { Stop } from '@/types/stop';
 import { StopArrivalsPanel } from './StopArrivalsPanel';
 
 const LA_DOWNTOWN: [number, number] = [-118.2437, 34.0522];
+// Polling stays as a fallback (WebSocket not configured / disconnected). When
+// the socket is open and feeding events, we still poll occasionally to
+// reconcile any vehicles the bbox missed (e.g., entered via teleport).
 const POLL_MS = 30_000;
+const POLL_FALLBACK_MS = 5_000;
+// How long a position update glides from old → new lat/lon. Vehicles update
+// every 3-5s so 1.5s gives a continuous-motion feel without overshooting
+// the next event.
+const GLIDE_MS = 1500;
 // Below this zoom, rendering ~13k stop graphics tanks ArcGIS' GraphicsLayer.
 // 13 is roughly "you can see individual streets" — matches Google Maps'
 // transit-stop visibility heuristic.
@@ -28,6 +37,24 @@ const INITIAL_BBOX: BBox = {
   maxLat: 34.15,
 };
 
+// One pin per active vehicle. Lives outside React state — pin geometry
+// updates every animation frame, which would thrash a render loop.
+interface AnimatedPin {
+  graphic: __esri.Graphic;
+  // Glide source (where it currently sits) and target (where the latest
+  // event placed it). `startedAt` is null when no animation is in flight.
+  fromLon: number;
+  fromLat: number;
+  toLon: number;
+  toLat: number;
+  startedAt: number | null;
+  // Last-seen color so we don't rebuild the symbol object on every event
+  // when nothing changed visually.
+  color: string;
+  // Most recent vehicle payload, kept around for popup re-rendering on click.
+  vehicle: Vehicle;
+}
+
 export function MetroMap() {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const viewRef = useRef<__esri.MapView | null>(null);
@@ -42,9 +69,16 @@ export function MetroMap() {
   // each pan would be wasteful.
   const stopsRef = useRef<Stop[] | null>(null);
   const stopsIndexRef = useRef<Map<string, Stop> | null>(null);
+  // Per-vehicle pins, keyed by vehicle_id, kept in a ref so animation
+  // updates don't trigger React renders.
+  const pinsRef = useRef<Map<string, AnimatedPin>>(new Map());
+  const rafRef = useRef<number | null>(null);
+  const socketRef = useRef<VehicleSocketHandle | null>(null);
   const [count, setCount] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [selectedStopId, setSelectedStopId] = useState<string | null>(null);
+  // 'live' = receiving WebSocket frames; 'polling' = fallback. Shown in HUD.
+  const [feedMode, setFeedMode] = useState<'live' | 'polling'>('polling');
 
   // Init the map once on mount. ArcGIS modules are imported here rather than
   // at module top so they only load in the browser, not at static-export build.
@@ -209,8 +243,169 @@ export function MetroMap() {
     layer.visible = true;
   }, []);
 
-  // Poll every 30s. Each tick re-derives the bbox from the current viewport
-  // so panning/zooming changes which vehicles we ask for.
+  // Merge a batch of vehicles into the pin map. Existing pins glide from
+  // their current geometry to the new position; new pins appear at their
+  // first reported lat/lon. Symbol/attribute updates only fire when the
+  // visible color or label actually changed — re-creating the SimpleMarker
+  // object on every frame causes ArcGIS to re-render unnecessarily.
+  const mergeVehicles = useCallback((vehicles: Vehicle[]) => {
+    const layer = layerRef.current;
+    const Graphic = graphicCtorRef.current;
+    if (!layer || !Graphic) return;
+
+    const pins = pinsRef.current;
+    const now = performance.now();
+
+    for (const v of vehicles) {
+      const id = v.vehicle_id;
+      if (!id) continue;
+
+      const outOfService = !v.route_id;
+      const dColor = delayColor(v.delay_seconds);
+      const color = outOfService ? '#888888' : dColor ?? routeColor(v.route_id);
+      const mph = typeof v.speed_mps === 'number' ? (v.speed_mps * 2.23694).toFixed(1) : '—';
+      const delayText = delayLabel(v.delay_seconds);
+      // Trailing slash matters: Next.js static export writes route/index.html,
+      // and CloudFront only auto-serves it when the path ends in '/'.
+      const routeHref = v.route_id ? `/route/?id=${encodeURIComponent(v.route_id)}` : '';
+
+      const existing = pins.get(id);
+      if (existing) {
+        // Glide from wherever the pin currently is — not from its previous
+        // target — so a fast event burst doesn't snap mid-animation.
+        const t = existing.startedAt
+          ? Math.min(1, (now - existing.startedAt) / GLIDE_MS)
+          : 1;
+        existing.fromLon = existing.fromLon + (existing.toLon - existing.fromLon) * t;
+        existing.fromLat = existing.fromLat + (existing.toLat - existing.fromLat) * t;
+        existing.toLon = v.lon;
+        existing.toLat = v.lat;
+        existing.startedAt = now;
+        existing.vehicle = v;
+        if (existing.color !== color) {
+          existing.color = color;
+          // SimpleMarkerSymbol exposes `color` as a settable property; mutate
+          // it in place rather than replacing the whole symbol object so TS
+          // doesn't have to reason about the SymbolProperties union.
+          (existing.graphic.symbol as __esri.SimpleMarkerSymbol).color = color as unknown as __esri.Color;
+        }
+        existing.graphic.attributes = {
+          vehicle_id: id,
+          route_id: v.route_id || '(out of service)',
+          mph,
+          delay_text: delayText,
+          route_href: routeHref,
+        };
+        continue;
+      }
+
+      const graphic = new Graphic({
+        geometry: { type: 'point', longitude: v.lon, latitude: v.lat },
+        symbol: {
+          type: 'simple-marker',
+          color,
+          size: 8,
+          outline: { color: '#0b0d10', width: 1 },
+        },
+        attributes: {
+          vehicle_id: id,
+          route_id: v.route_id || '(out of service)',
+          mph,
+          delay_text: delayText,
+          route_href: routeHref,
+        },
+        popupTemplate: {
+          title: 'Route {route_id}',
+          content: routeHref
+            ? 'Vehicle {vehicle_id} — {mph} mph — <b>{delay_text}</b><br/><a href="{route_href}">→ route detail</a>'
+            : 'Vehicle {vehicle_id} — {mph} mph — {delay_text}',
+        },
+      });
+      layer.add(graphic);
+      pins.set(id, {
+        graphic,
+        fromLon: v.lon,
+        fromLat: v.lat,
+        toLon: v.lon,
+        toLat: v.lat,
+        startedAt: null,
+        color,
+        vehicle: v,
+      });
+    }
+
+    setCount(pins.size);
+  }, []);
+
+  // Run a per-frame loop that lerps each pin's geometry from `from` to
+  // `to`. The work is constant-time per pin per frame; for ~1.7k visible
+  // vehicles that's ~50k geometry assignments/sec — well within ArcGIS'
+  // budget on a modern laptop.
+  useEffect(() => {
+    function tick() {
+      const now = performance.now();
+      for (const pin of pinsRef.current.values()) {
+        if (pin.startedAt == null) continue;
+        const t = Math.min(1, (now - pin.startedAt) / GLIDE_MS);
+        const lon = pin.fromLon + (pin.toLon - pin.fromLon) * t;
+        const lat = pin.fromLat + (pin.toLat - pin.fromLat) * t;
+        pin.graphic.geometry = { type: 'point', longitude: lon, latitude: lat } as __esri.Point;
+        if (t >= 1) {
+          pin.fromLon = pin.toLon;
+          pin.fromLat = pin.toLat;
+          pin.startedAt = null;
+        }
+      }
+      rafRef.current = requestAnimationFrame(tick);
+    }
+    rafRef.current = requestAnimationFrame(tick);
+    return () => {
+      if (rafRef.current != null) cancelAnimationFrame(rafRef.current);
+      rafRef.current = null;
+    };
+  }, []);
+
+  // Live feed: open a WebSocket, send `subscribe` whenever the viewport
+  // settles on a new bbox. Falls back to no-op when WS_URL isn't set.
+  useEffect(() => {
+    const handle = openVehicleSocket({
+      onMessage: (msg) => {
+        if (msg.type === 'positions') {
+          mergeVehicles(msg.vehicles);
+          setError(null);
+        }
+      },
+      onStateChange: (state) => {
+        setFeedMode(state === 'open' ? 'live' : 'polling');
+      },
+    });
+    socketRef.current = handle;
+    return () => {
+      handle.close();
+      socketRef.current = null;
+    };
+  }, [mergeVehicles]);
+
+  // Re-subscribe on viewport stability. The map's `stationary` watcher
+  // already fires for stops; we add a separate subscription here rather
+  // than trying to share that handler so this hook is independent.
+  useEffect(() => {
+    const view = viewRef.current;
+    if (!view) return;
+    const handle = view.watch('stationary', (stationary: boolean) => {
+      if (!stationary) return;
+      const bbox = currentBBox(view, projectRef.current) ?? INITIAL_BBOX;
+      socketRef.current?.setBBox(bbox);
+    });
+    return () => handle.remove();
+    // viewRef.current is set inside the init effect; we re-run when count
+    // first goes non-null which guarantees the view exists.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [count]);
+
+  // Polling: bootstraps initial state and acts as a fallback when WS is
+  // unavailable. Faster cadence (5s) when we're in polling mode, slow (30s)
+  // when WS is doing the heavy lifting.
   useEffect(() => {
     let cancelled = false;
     const ctrl = new AbortController();
@@ -220,8 +415,7 @@ export function MetroMap() {
         const bbox = currentBBox(viewRef.current, projectRef.current) ?? INITIAL_BBOX;
         const vehicles = await fetchVehicles(bbox, ctrl.signal);
         if (cancelled) return;
-        renderVehicles(vehicles);
-        setCount(vehicles.length);
+        mergeVehicles(vehicles);
         setError(null);
       } catch (e) {
         if ((e as Error).name === 'AbortError') return;
@@ -230,69 +424,14 @@ export function MetroMap() {
     };
 
     tick();
-    const id = setInterval(tick, POLL_MS);
+    const interval = feedMode === 'live' ? POLL_MS : POLL_FALLBACK_MS;
+    const id = setInterval(tick, interval);
     return () => {
       cancelled = true;
       ctrl.abort();
       clearInterval(id);
     };
-  }, []);
-
-  function renderVehicles(vehicles: Vehicle[]) {
-    const layer = layerRef.current;
-    const Graphic = graphicCtorRef.current;
-    if (!layer || !Graphic) return;
-
-    layer.removeAll();
-    for (const v of vehicles) {
-      // Per API contract: empty route_id = deadhead/layover. Render in grey
-      // rather than skipping, so the user sees the vehicle still exists.
-      const outOfService = !v.route_id;
-      // Delay color when known, else fall back to per-route hue, else grey
-      // for out-of-service. This gives schedule reliability the strongest
-      // visual signal while still distinguishing routes when no delay is
-      // available (off-route / pre/post-trip vehicles).
-      const dColor = delayColor(v.delay_seconds);
-      const color = outOfService
-        ? '#888888'
-        : dColor ?? routeColor(v.route_id);
-      const symbol = {
-        type: 'simple-marker' as const,
-        color,
-        size: 8,
-        outline: { color: '#0b0d10', width: 1 },
-      };
-      const mph = typeof v.speed_mps === 'number' ? (v.speed_mps * 2.23694).toFixed(1) : '—';
-      const delayText = delayLabel(v.delay_seconds);
-      // ArcGIS popup supports a clickable HTML link via a custom action.
-      // Cleanest is to embed a <a href> in content — opens in same tab and
-      // hits the route detail page. ArcGIS sanitizes <script> but allows <a>.
-      // Trailing slash matters: Next.js static export writes `route/index.html`,
-      // and CloudFront only auto-serves index.html when the path ends in '/'.
-      // Without it the request 404s and our error-fallback rule sends users
-      // back to the home page.
-      const routeHref = v.route_id ? `/route/?id=${encodeURIComponent(v.route_id)}` : '';
-      layer.add(
-        new Graphic({
-          geometry: { type: 'point', longitude: v.lon, latitude: v.lat },
-          symbol,
-          attributes: {
-            vehicle_id: v.vehicle_id,
-            route_id: v.route_id || '(out of service)',
-            mph,
-            delay_text: delayText,
-            route_href: routeHref,
-          },
-          popupTemplate: {
-            title: 'Route {route_id}',
-            content: routeHref
-              ? 'Vehicle {vehicle_id} — {mph} mph — <b>{delay_text}</b><br/><a href="{route_href}">→ route detail</a>'
-              : 'Vehicle {vehicle_id} — {mph} mph — {delay_text}',
-          },
-        }),
-      );
-    }
-  }
+  }, [feedMode, mergeVehicles]);
 
   // ESC key closes the panel. Lives in its own effect so the listener
   // attaches/detaches based on `selectedStopId` rather than mount.
@@ -314,6 +453,9 @@ export function MetroMap() {
         <div className="font-semibold">LA Metro — Live</div>
         <div className="opacity-80">
           {count === null ? 'loading…' : `${count} vehicle${count === 1 ? '' : 's'}`}
+        </div>
+        <div className="text-xs opacity-60">
+          {feedMode === 'live' ? '● ws' : '○ polling'}
         </div>
         {error && <div className="text-red-400">err: {error}</div>}
       </div>
