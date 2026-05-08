@@ -48,7 +48,8 @@ const processing = new ProcessingStack(app, 'LaMetro-ProcessingStack', {
 const api = new ApiStack(app, 'LaMetro-ApiStack', {
   env,
   hotVehiclesTable: storage.hotVehiclesTable,
-  description: 'Phase 2 read API: GET /vehicles?bbox=… backed by a Lambda + REST API Gateway.',
+  routeAggregatesTable: storage.routeAggregatesTable,
+  description: 'Read API: GET /vehicles + GET /routes/{routeId}/aggregates.',
 });
 
 const frontend = new FrontendStack(app, 'LaMetro-FrontendStack', {

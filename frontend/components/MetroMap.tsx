@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState } from 'react';
 import { fetchVehicles, type BBox } from '@/lib/api';
-import { routeColor } from '@/lib/colors';
+import { delayColor, delayLabel, routeColor } from '@/lib/colors';
 import type { Vehicle } from '@/types/vehicle';
 
 const LA_DOWNTOWN: [number, number] = [-118.2437, 34.0522];
@@ -114,7 +114,14 @@ export function MetroMap() {
       // Per API contract: empty route_id = deadhead/layover. Render in grey
       // rather than skipping, so the user sees the vehicle still exists.
       const outOfService = !v.route_id;
-      const color = outOfService ? '#888888' : routeColor(v.route_id);
+      // Delay color when known, else fall back to per-route hue, else grey
+      // for out-of-service. This gives schedule reliability the strongest
+      // visual signal while still distinguishing routes when no delay is
+      // available (off-route / pre/post-trip vehicles).
+      const dColor = delayColor(v.delay_seconds);
+      const color = outOfService
+        ? '#888888'
+        : dColor ?? routeColor(v.route_id);
       const symbol = {
         type: 'simple-marker' as const,
         color,
@@ -122,6 +129,15 @@ export function MetroMap() {
         outline: { color: '#0b0d10', width: 1 },
       };
       const mph = typeof v.speed_mps === 'number' ? (v.speed_mps * 2.23694).toFixed(1) : '—';
+      const delayText = delayLabel(v.delay_seconds);
+      // ArcGIS popup supports a clickable HTML link via a custom action.
+      // Cleanest is to embed a <a href> in content — opens in same tab and
+      // hits the route detail page. ArcGIS sanitizes <script> but allows <a>.
+      // Trailing slash matters: Next.js static export writes `route/index.html`,
+      // and CloudFront only auto-serves index.html when the path ends in '/'.
+      // Without it the request 404s and our error-fallback rule sends users
+      // back to the home page.
+      const routeHref = v.route_id ? `/route/?id=${encodeURIComponent(v.route_id)}` : '';
       layer.add(
         new Graphic({
           geometry: { type: 'point', longitude: v.lon, latitude: v.lat },
@@ -130,10 +146,14 @@ export function MetroMap() {
             vehicle_id: v.vehicle_id,
             route_id: v.route_id || '(out of service)',
             mph,
+            delay_text: delayText,
+            route_href: routeHref,
           },
           popupTemplate: {
             title: 'Route {route_id}',
-            content: 'Vehicle {vehicle_id} — {mph} mph',
+            content: routeHref
+              ? 'Vehicle {vehicle_id} — {mph} mph — <b>{delay_text}</b><br/><a href="{route_href}">→ route detail</a>'
+              : 'Vehicle {vehicle_id} — {mph} mph — {delay_text}',
           },
         }),
       );

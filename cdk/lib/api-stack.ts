@@ -8,6 +8,7 @@ import * as dynamodb from 'aws-cdk-lib/aws-dynamodb';
 
 export interface ApiStackProps extends cdk.StackProps {
   hotVehiclesTable: dynamodb.ITable;
+  routeAggregatesTable: dynamodb.ITable;
 }
 
 /**
@@ -37,16 +38,22 @@ export class ApiStack extends cdk.Stack {
       handler: 'handler.lambda_handler',
       code: lambda.Code.fromAsset(lambdaAssetPath),
       memorySize: 512,
-      timeout: cdk.Duration.seconds(10),
+      // 30s — worst-case /vehicles bbox covers ~500 precision-6 cells, each
+      // a sequential DDB query at ~30-50ms. P95 stays ~3-5s but cold starts
+      // and high-fanout bboxes need the headroom.
+      timeout: cdk.Duration.seconds(30),
       environment: {
         HOT_VEHICLES_TABLE_NAME: props.hotVehiclesTable.tableName,
+        ROUTE_AGGREGATES_TABLE_NAME: props.routeAggregatesTable.tableName,
         GEOHASH_PRECISION: '6',
       },
       logGroup,
-      description: 'Phase 2: REST query for live vehicles in a bbox.',
+      description:
+        'Read API: GET /vehicles?bbox=… and GET /routes/{routeId}/aggregates.',
     });
 
     props.hotVehiclesTable.grantReadData(queryFn);
+    props.routeAggregatesTable.grantReadData(queryFn);
 
     const api = new apigw.LambdaRestApi(this, 'QueryApi', {
       restApiName: 'la-metro-query-api',
@@ -67,6 +74,12 @@ export class ApiStack extends cdk.Stack {
 
     const vehicles = api.root.addResource('vehicles');
     vehicles.addMethod('GET');
+
+    // /routes/{routeId}/aggregates — used by the route detail page.
+    const routes = api.root.addResource('routes');
+    const routeById = routes.addResource('{routeId}');
+    const aggregates = routeById.addResource('aggregates');
+    aggregates.addMethod('GET');
 
     new cdk.CfnOutput(this, 'ApiUrl', {
       value: api.url,

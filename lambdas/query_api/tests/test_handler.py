@@ -3,11 +3,25 @@
 from __future__ import annotations
 
 import json
+from decimal import Decimal
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from lambdas.query_api import handler
+
+
+def _vehicles_event(qs: dict[str, str]) -> dict:
+    return {"resource": "/vehicles", "httpMethod": "GET", "queryStringParameters": qs}
+
+
+def _aggregates_event(route_id: str, qs: dict[str, str] | None = None) -> dict:
+    return {
+        "resource": "/routes/{routeId}/aggregates",
+        "httpMethod": "GET",
+        "pathParameters": {"routeId": route_id},
+        "queryStringParameters": qs or {},
+    }
 
 
 def test_parse_bbox_happy_path():
@@ -18,7 +32,7 @@ def test_parse_bbox_happy_path():
 
 def test_parse_bbox_rejects_inverted():
     with pytest.raises(ValueError):
-        handler._parse_bbox("-118.20,34.10,-118.30,34.02")  # max < min
+        handler._parse_bbox("-118.20,34.10,-118.30,34.02")
 
 
 def test_parse_bbox_rejects_too_few_floats():
@@ -29,32 +43,34 @@ def test_parse_bbox_rejects_too_few_floats():
 def test_covering_geohashes_returns_at_least_one_cell():
     cells = handler.covering_geohashes(-118.26, 34.04, -118.24, 34.06)
     assert len(cells) >= 1
-    # All cells should share the LA-area geohash prefix.
     assert all(c.startswith("9q") for c in cells)
 
 
-def test_lambda_handler_400_on_missing_bbox():
-    resp = handler.lambda_handler({"queryStringParameters": {}}, None)
+def test_unknown_resource_returns_404():
+    resp = handler.lambda_handler({"resource": "/something-else"}, None)
+    assert resp["statusCode"] == 404
+
+
+def test_vehicles_400_on_missing_bbox():
+    resp = handler.lambda_handler(_vehicles_event({}), None)
     assert resp["statusCode"] == 400
     assert json.loads(resp["body"])["error"] == "missing_bbox"
 
 
-def test_lambda_handler_400_on_invalid_bbox():
-    resp = handler.lambda_handler({"queryStringParameters": {"bbox": "garbage"}}, None)
+def test_vehicles_400_on_invalid_bbox():
+    resp = handler.lambda_handler(_vehicles_event({"bbox": "garbage"}), None)
     assert resp["statusCode"] == 400
 
 
-def test_lambda_handler_400_on_bbox_too_large():
-    resp = handler.lambda_handler(
-        {"queryStringParameters": {"bbox": "-119,33,-117,35"}}, None  # ~2°×2° = 4 deg²
-    )
+def test_vehicles_400_on_bbox_too_large():
+    resp = handler.lambda_handler(_vehicles_event({"bbox": "-119,33,-117,35"}), None)
     assert resp["statusCode"] == 400
     assert json.loads(resp["body"])["error"] == "bbox_too_large"
 
 
-def test_lambda_handler_returns_vehicles_within_bbox():
+def test_vehicles_returns_within_bbox_with_int_delay():
     fake_table = MagicMock()
-    # Each query returns one vehicle.
+    # Decimal incoming from boto3 resource API; we should emit a clean int.
     fake_table.query.return_value = {
         "Items": [
             {
@@ -63,24 +79,25 @@ def test_lambda_handler_returns_vehicles_within_bbox():
                 "lat": "34.05",
                 "lon": "-118.25",
                 "last_updated": "2026-05-06T22:52:00Z",
-                "delay_seconds": None,
+                "delay_seconds": Decimal("325"),
             }
         ]
     }
 
-    with patch.object(handler, "_table_handle", return_value=fake_table):
+    with patch.object(handler, "_hot", return_value=fake_table):
         resp = handler.lambda_handler(
-            {"queryStringParameters": {"bbox": "-118.26,34.04,-118.24,34.06"}}, None
+            _vehicles_event({"bbox": "-118.26,34.04,-118.24,34.06"}), None
         )
 
     assert resp["statusCode"] == 200
     body = json.loads(resp["body"])
     assert body["count"] >= 1
-    # Should have called query once per covering cell, but at least once.
-    assert fake_table.query.called
+    v = body["vehicles"][0]
+    assert v["delay_seconds"] == 325  # int in JSON, not "325" string
+    assert isinstance(v["delay_seconds"], int)
 
 
-def test_lambda_handler_filters_by_route():
+def test_vehicles_filters_by_route():
     fake_table = MagicMock()
     fake_table.query.return_value = {
         "Items": [
@@ -89,11 +106,76 @@ def test_lambda_handler_filters_by_route():
         ]
     }
 
-    with patch.object(handler, "_table_handle", return_value=fake_table):
+    with patch.object(handler, "_hot", return_value=fake_table):
         resp = handler.lambda_handler(
-            {"queryStringParameters": {"bbox": "-118.26,34.04,-118.24,34.06", "route_id": "720"}},
-            None,
+            _vehicles_event({"bbox": "-118.26,34.04,-118.24,34.06", "route_id": "720"}), None
         )
 
     body = json.loads(resp["body"])
     assert all(v["route_id"] == "720" for v in body["vehicles"])
+
+
+def test_aggregates_400_on_missing_route_id():
+    resp = handler.lambda_handler(
+        {"resource": "/routes/{routeId}/aggregates", "pathParameters": {}}, None
+    )
+    assert resp["statusCode"] == 400
+
+
+def test_aggregates_returns_windows_newest_first():
+    fake_table = MagicMock()
+    fake_table.query.return_value = {
+        "Items": [
+            {
+                "route_id": "720",
+                "window_start_iso": "2026-05-08T01:00:00Z",
+                "vehicle_count": Decimal("18"),
+                "avg_delay_seconds": Decimal("180"),
+                "p95_delay_seconds": Decimal("420"),
+                "on_time_pct": "33.3",
+            },
+            {
+                "route_id": "720",
+                "window_start_iso": "2026-05-08T00:55:00Z",
+                "vehicle_count": Decimal("16"),
+                "avg_delay_seconds": Decimal("210"),
+                "p95_delay_seconds": Decimal("480"),
+                "on_time_pct": "25.0",
+            },
+        ]
+    }
+
+    with patch.object(handler, "_agg", return_value=fake_table):
+        resp = handler.lambda_handler(_aggregates_event("720"), None)
+
+    assert resp["statusCode"] == 200
+    body = json.loads(resp["body"])
+    assert body["route_id"] == "720"
+    assert body["count"] == 2
+    # Confirm Decimal → int casting and on_time_pct → float
+    assert body["windows"][0]["vehicle_count"] == 18
+    assert isinstance(body["windows"][0]["vehicle_count"], int)
+    assert body["windows"][0]["avg_delay_seconds"] == 180
+    assert body["windows"][0]["on_time_pct"] == pytest.approx(33.3)
+
+
+def test_aggregates_handles_phase_4b_rows_without_delays():
+    """Some 4b-era rows have no delay fields; the API shouldn't blow up."""
+    fake_table = MagicMock()
+    fake_table.query.return_value = {
+        "Items": [
+            {
+                "route_id": "720",
+                "window_start_iso": "2026-05-07T22:00:00Z",
+                "vehicle_count": Decimal("4"),
+                # no avg/p95/on_time_pct
+            }
+        ]
+    }
+    with patch.object(handler, "_agg", return_value=fake_table):
+        resp = handler.lambda_handler(_aggregates_event("720"), None)
+    body = json.loads(resp["body"])
+    w = body["windows"][0]
+    assert w["avg_delay_seconds"] is None
+    assert w["p95_delay_seconds"] is None
+    assert w["on_time_pct"] is None
