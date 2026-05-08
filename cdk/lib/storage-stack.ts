@@ -24,6 +24,7 @@ export class StorageStack extends cdk.Stack {
   public readonly vehicleStream: kinesis.Stream;
   public readonly hotVehiclesTable: dynamodb.Table;
   public readonly routeAggregatesTable: dynamodb.Table;
+  public readonly websocketConnectionsTable: dynamodb.Table;
   public readonly archiveBucket: s3.Bucket;
 
   constructor(scope: Construct, id: string, props: StorageStackProps = {}) {
@@ -64,6 +65,19 @@ export class StorageStack extends cdk.Stack {
       tableName: 'la-metro-route-aggregates',
       partitionKey: { name: 'route_id', type: dynamodb.AttributeType.STRING },
       sortKey: { name: 'window_start_iso', type: dynamodb.AttributeType.STRING },
+      billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
+      timeToLiveAttribute: 'ttl_epoch',
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+    });
+
+    // Phase 5a: each open WebSocket has one row here. Connection Lambdas
+    // write/delete on $connect / $disconnect; the subscribe handler updates
+    // the bbox/route filter. Enrichment scans this table to fan out position
+    // updates. 2h TTL guarantees stale rows can't accumulate even if the
+    // disconnect handler fails to fire (e.g., abrupt client kill).
+    this.websocketConnectionsTable = new dynamodb.Table(this, 'WebSocketConnectionsTable', {
+      tableName: 'la-metro-websocket-connections',
+      partitionKey: { name: 'connection_id', type: dynamodb.AttributeType.STRING },
       billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
       timeToLiveAttribute: 'ttl_epoch',
       removalPolicy: cdk.RemovalPolicy.DESTROY,
@@ -183,6 +197,9 @@ export class StorageStack extends cdk.Stack {
     new cdk.CfnOutput(this, 'VehicleStreamArn', { value: this.vehicleStream.streamArn });
     new cdk.CfnOutput(this, 'HotVehiclesTableName', { value: this.hotVehiclesTable.tableName });
     new cdk.CfnOutput(this, 'RouteAggregatesTableName', { value: this.routeAggregatesTable.tableName });
+    new cdk.CfnOutput(this, 'WebSocketConnectionsTableName', {
+      value: this.websocketConnectionsTable.tableName,
+    });
     new cdk.CfnOutput(this, 'ArchiveBucketName', { value: this.archiveBucket.bucketName });
   }
 }
