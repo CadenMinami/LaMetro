@@ -9,3 +9,31 @@ export function routeColor(routeId: string): string {
   const hue = Math.abs(hash) % 360;
   return `hsl(${hue}, 70%, 55%)`;
 }
+
+// Phase 4d: color a vehicle pin by its schedule deviation. Buckets match
+// the spec — green <1m, yellow 1-3m, orange 3-5m, red >5m. Negative delays
+// (vehicle is early) are folded into the same buckets by absolute value,
+// since both ends of "out of tolerance" are equally interesting visually.
+//
+// Returns null when the delay is unknown (deadhead, off-route, pre/post
+// trip), so the caller can fall back to a neutral "no data" rendering.
+export function delayColor(delaySeconds: number | null | undefined): string | null {
+  if (delaySeconds === null || delaySeconds === undefined) return null;
+  const abs = Math.abs(delaySeconds);
+  if (abs < 60) return '#22c55e';   // green-500
+  if (abs < 180) return '#eab308';  // yellow-500
+  if (abs < 300) return '#f97316';  // orange-500
+  return '#ef4444';                 // red-500
+}
+
+// Friendly label for a delay value — used in popups and the route page.
+export function delayLabel(delaySeconds: number | null | undefined): string {
+  if (delaySeconds === null || delaySeconds === undefined) return '—';
+  const abs = Math.abs(delaySeconds);
+  const mins = Math.floor(abs / 60);
+  const secs = abs % 60;
+  const human = mins > 0 ? `${mins}m ${secs}s` : `${secs}s`;
+  if (delaySeconds > 30) return `${human} late`;
+  if (delaySeconds < -30) return `${human} early`;
+  return 'on time';
+}
