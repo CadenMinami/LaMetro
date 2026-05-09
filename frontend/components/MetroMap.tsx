@@ -24,14 +24,14 @@ const GLIDE_MS = 1500;
 // is much stricter — anything > 5 min stale is almost certainly a vehicle
 // that left our bbox or finished its trip.
 const PIN_STALE_MS = 5 * 60 * 1000;
-// Below this zoom, rendering ~13k stop graphics tanks ArcGIS' GraphicsLayer.
-// 13 is roughly "you can see individual streets" — matches Google Maps'
-// transit-stop visibility heuristic.
-const STOPS_MIN_ZOOM = 13;
-// Cap the number of stops rendered at any one time. The bbox at zoom 13
-// covers a few hundred stops in dense LA neighborhoods; beyond that you
-// can't tell them apart visually anyway.
-const MAX_STOPS_RENDERED = 1500;
+// Stops layer is intentionally hidden until the user zooms in enough that
+// individual stops are useful (zoom 15 ≈ "you can read street names"). At
+// zoom 13-14, stops just turn into a 12k-dot grid that dominates the
+// vehicles you actually came to see.
+const STOPS_MIN_ZOOM = 15;
+// Cap rendered stops to keep the GraphicsLayer responsive even on a
+// dense viewport.
+const MAX_STOPS_RENDERED = 800;
 
 // Fallback bbox used before the MapView is ready. ~25km × 25km around
 // downtown — well under the API's 50km × 50km cap (see API_CONTRACT.md).
@@ -221,12 +221,8 @@ export function MetroMap() {
 
     layer.removeAll();
     for (const s of slice) {
-      // Color by the first route that visits this stop. Multi-route stops
-      // get whichever route_id sorts first — good enough as a hint, the
-      // panel shows the full list when the user clicks.
-      const tint = s.routes[0] ? routeColor(s.routes[0]) : '#9ca3af';
       // Larger transparent hit graphic underneath gives a 12px touch target
-      // even though the visible dot is only 5px.
+      // even though the visible dot is only 4px.
       layer.add(
         new Graphic({
           geometry: { type: 'point', longitude: s.lon, latitude: s.lat },
@@ -239,14 +235,17 @@ export function MetroMap() {
           attributes: { stop_id: s.id },
         }),
       );
+      // Stops should *recede* against the dark basemap, not compete with
+      // vehicle pins for attention. Small, single neutral fill, no outline.
+      // The vehicle pins (8px, saturated colors) win the visual hierarchy.
       layer.add(
         new Graphic({
           geometry: { type: 'point', longitude: s.lon, latitude: s.lat },
           symbol: {
             type: 'simple-marker',
-            color: tint,
-            size: 5,
-            outline: { color: '#0b0d10', width: 1 },
+            color: [180, 180, 200, 0.5],
+            size: 4,
+            outline: { color: [0, 0, 0, 0], width: 0 },
           },
           attributes: { stop_id: s.id },
         }),
@@ -392,9 +391,9 @@ export function MetroMap() {
     setInServiceCount(visibleInService);
     // Only refresh the dropdown list when it actually changed — sorting
     // and re-allocating ~240 strings on every batch causes React to
-    // re-render the <select>'s options unnecessarily.
+    // re-render the route picker unnecessarily.
     setRoutes((prev) => {
-      const next = [...routeSet].sort();
+      const next = [...routeSet].sort(routeSort);
       if (prev.length === next.length && prev.every((r, i) => r === next[i])) {
         return prev;
       }
@@ -544,21 +543,38 @@ export function MetroMap() {
 
         <div className="text-xs">
           <label htmlFor="route-filter" className="block opacity-60 mb-1">
-            route
+            route ({routes.length})
           </label>
-          <select
-            id="route-filter"
-            value={routeFilter}
-            onChange={(e) => setRouteFilter(e.target.value)}
-            className="w-full rounded bg-zinc-800 border border-zinc-700 px-2 py-1"
-          >
-            <option value="">all routes</option>
+          <div className="flex gap-1">
+            <input
+              id="route-filter"
+              list="route-options"
+              type="text"
+              value={routeFilter}
+              onChange={(e) => setRouteFilter(e.target.value)}
+              placeholder="all routes — type to filter"
+              className="w-full rounded bg-zinc-800 border border-zinc-700 px-2 py-1
+                         placeholder:text-zinc-500 focus:outline-none focus:border-zinc-500"
+              autoComplete="off"
+              spellCheck={false}
+            />
+            {routeFilter && (
+              <button
+                type="button"
+                onClick={() => setRouteFilter('')}
+                className="rounded bg-zinc-800 border border-zinc-700 px-2
+                           text-zinc-300 hover:bg-zinc-700"
+                aria-label="clear route filter"
+              >
+                ×
+              </button>
+            )}
+          </div>
+          <datalist id="route-options">
             {routes.map((r) => (
-              <option key={r} value={r}>
-                {r}
-              </option>
+              <option key={r} value={r} />
             ))}
-          </select>
+          </datalist>
         </div>
 
         {error && <div className="text-red-400 text-xs">err: {error}</div>}
@@ -572,6 +588,18 @@ export function MetroMap() {
       )}
     </div>
   );
+}
+
+// Sort by the leading numeric part of the route_id so "2", "10", "720"
+// land in human order rather than "10", "2", "720" lexical order. Falls
+// back to localeCompare for non-numeric routes (e.g. "Red", "Purple").
+function routeSort(a: string, b: string): number {
+  const ka = parseInt(a.match(/^(\d+)/)?.[1] ?? '', 10);
+  const kb = parseInt(b.match(/^(\d+)/)?.[1] ?? '', 10);
+  if (!Number.isNaN(ka) && !Number.isNaN(kb)) return ka - kb || a.localeCompare(b);
+  if (!Number.isNaN(ka)) return -1;
+  if (!Number.isNaN(kb)) return 1;
+  return a.localeCompare(b);
 }
 
 function currentBBox(
