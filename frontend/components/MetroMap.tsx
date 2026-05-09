@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { fetchVehicles, type BBox } from '@/lib/api';
-import { delayColor, delayLabel, routeColor } from '@/lib/colors';
+import { bearingCompass, delayColor, delayLabel, routeColor, timeAgo } from '@/lib/colors';
 import { getStops, indexStops, stopsInBBox } from '@/lib/stops';
 import { openVehicleSocket, type VehicleSocketHandle } from '@/lib/socket';
 import type { Vehicle } from '@/types/vehicle';
@@ -276,9 +276,21 @@ export function MetroMap() {
       const color = outOfService ? '#888888' : dColor ?? routeColor(v.route_id);
       const mph = typeof v.speed_mps === 'number' ? (v.speed_mps * 2.23694).toFixed(1) : '—';
       const delayText = delayLabel(v.delay_seconds);
+      const bearingText = bearingCompass(v.bearing);
       // Trailing slash matters: Next.js static export writes route/index.html,
       // and CloudFront only auto-serves it when the path ends in '/'.
       const routeHref = v.route_id ? `/route/?id=${encodeURIComponent(v.route_id)}` : '';
+      const attrs = {
+        vehicle_id: id,
+        route_id: v.route_id || '(out of service)',
+        trip_id: v.trip_id || '',
+        mph,
+        delay_text: delayText,
+        delay_seconds: v.delay_seconds ?? null,
+        bearing_text: bearingText,
+        last_updated: v.last_updated ?? '',
+        route_href: routeHref,
+      };
 
       const existing = pins.get(id);
       if (existing) {
@@ -300,13 +312,7 @@ export function MetroMap() {
           // doesn't have to reason about the SymbolProperties union.
           (existing.graphic.symbol as __esri.SimpleMarkerSymbol).color = color as unknown as __esri.Color;
         }
-        existing.graphic.attributes = {
-          vehicle_id: id,
-          route_id: v.route_id || '(out of service)',
-          mph,
-          delay_text: delayText,
-          route_href: routeHref,
-        };
+        existing.graphic.attributes = attrs;
         continue;
       }
 
@@ -318,18 +324,13 @@ export function MetroMap() {
           size: 8,
           outline: { color: '#0b0d10', width: 1 },
         },
-        attributes: {
-          vehicle_id: id,
-          route_id: v.route_id || '(out of service)',
-          mph,
-          delay_text: delayText,
-          route_href: routeHref,
-        },
+        attributes: attrs,
         popupTemplate: {
           title: 'Route {route_id}',
-          content: routeHref
-            ? 'Vehicle {vehicle_id} — {mph} mph — <b>{delay_text}</b><br/><a href="{route_href}">→ route detail</a>'
-            : 'Vehicle {vehicle_id} — {mph} mph — {delay_text}',
+          // The function form lets us recompute "updated Xs ago" each time
+          // the popup opens (the static {token} interpolation locks values
+          // at graphic-creation time).
+          content: vehiclePopupContent,
         },
       });
       layer.add(graphic);
@@ -588,6 +589,71 @@ export function MetroMap() {
       )}
     </div>
   );
+}
+
+// Build a richer info card for the vehicle popup. Returns a real
+// HTMLElement so we can compute relative time at open-time (the {token}
+// templating ArcGIS supports is static).
+function vehiclePopupContent(target: { graphic: __esri.Graphic }): HTMLElement {
+  const a = target.graphic.attributes ?? {};
+  const root = document.createElement('div');
+  root.style.cssText =
+    'font-family: system-ui, -apple-system, sans-serif; font-size: 13px;' +
+    'min-width: 220px; line-height: 1.45;';
+
+  const delaySec: number | null = typeof a.delay_seconds === 'number' ? a.delay_seconds : null;
+  const delayPillColor = delayColor(delaySec) ?? '#52525b';
+  const delayPillText = delayLabel(delaySec);
+
+  // Top row: delay pill + speed
+  const top = document.createElement('div');
+  top.style.cssText = 'display: flex; gap: 8px; align-items: center; margin-bottom: 8px;';
+  const pill = document.createElement('span');
+  pill.textContent = delayPillText;
+  pill.style.cssText =
+    `background: ${delayPillColor}; color: #0b0d10; padding: 2px 8px;` +
+    'border-radius: 999px; font-weight: 600; font-size: 12px;';
+  top.appendChild(pill);
+  const speed = document.createElement('span');
+  speed.textContent = `${a.mph} mph`;
+  speed.style.cssText = 'opacity: 0.7;';
+  top.appendChild(speed);
+  root.appendChild(top);
+
+  // Detail rows.
+  const rows: Array<[string, string]> = [
+    ['Vehicle', String(a.vehicle_id ?? '—')],
+    ['Trip', a.trip_id ? String(a.trip_id) : '—'],
+    ['Heading', String(a.bearing_text ?? '—')],
+    ['Updated', timeAgo(a.last_updated)],
+  ];
+  for (const [k, v] of rows) {
+    const row = document.createElement('div');
+    row.style.cssText = 'display: flex; gap: 8px; margin-top: 2px;';
+    const key = document.createElement('span');
+    key.textContent = k;
+    key.style.cssText = 'opacity: 0.55; min-width: 60px;';
+    const val = document.createElement('span');
+    val.textContent = v;
+    if (k === 'Trip' && v !== '—') {
+      val.style.cssText = 'font-family: ui-monospace, SFMono-Regular, Menlo, monospace;';
+    }
+    row.appendChild(key);
+    row.appendChild(val);
+    root.appendChild(row);
+  }
+
+  // Footer link to route detail page.
+  if (a.route_href) {
+    const link = document.createElement('a');
+    link.href = String(a.route_href);
+    link.textContent = '→ route detail';
+    link.style.cssText =
+      'display: inline-block; margin-top: 10px; color: #60a5fa; text-decoration: none;';
+    root.appendChild(link);
+  }
+
+  return root;
 }
 
 // Sort by the leading numeric part of the route_id so "2", "10", "720"
