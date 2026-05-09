@@ -37,3 +37,28 @@ export function delayLabel(delaySeconds: number | null | undefined): string {
   if (delaySeconds < -30) return `${human} early`;
   return 'on time';
 }
+
+// Convert a compass heading in degrees to a 16-point compass label (N, NNE, NE, ...).
+// Falls back to "—" when the bearing is missing.
+export function bearingCompass(bearing: number | null | undefined): string {
+  if (bearing === null || bearing === undefined || Number.isNaN(bearing)) return '—';
+  const points = ['N', 'NNE', 'NE', 'ENE', 'E', 'ESE', 'SE', 'SSE',
+                  'S', 'SSW', 'SW', 'WSW', 'W', 'WNW', 'NW', 'NNW'];
+  const idx = Math.round(((bearing % 360) + 360) % 360 / 22.5) % 16;
+  return `${points[idx]} ${Math.round(bearing)}°`;
+}
+
+// "Xs ago" / "Xm ago" relative time. Used in vehicle popups so the user
+// knows how fresh the data is. Computed at popup-open time, not live.
+export function timeAgo(iso: string | null | undefined, now: number = Date.now()): string {
+  if (!iso) return '—';
+  const t = Date.parse(iso);
+  if (Number.isNaN(t)) return '—';
+  const sec = Math.max(0, Math.round((now - t) / 1000));
+  if (sec < 5) return 'just now';
+  if (sec < 60) return `${sec}s ago`;
+  const min = Math.floor(sec / 60);
+  if (min < 60) return `${min}m ${sec % 60}s ago`;
+  const hr = Math.floor(min / 60);
+  return `${hr}h ${min % 60}m ago`;
+}
