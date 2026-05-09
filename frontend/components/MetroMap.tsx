@@ -19,6 +19,11 @@ const POLL_FALLBACK_MS = 5_000;
 // every 3-5s so 1.5s gives a continuous-motion feel without overshooting
 // the next event.
 const GLIDE_MS = 1500;
+// Drop a pin once its server-side `last_updated` is older than this. The
+// hot-vehicles TTL is 1 hour, but at the dashboard level "still moving"
+// is much stricter — anything > 5 min stale is almost certainly a vehicle
+// that left our bbox or finished its trip.
+const PIN_STALE_MS = 5 * 60 * 1000;
 // Below this zoom, rendering ~13k stop graphics tanks ArcGIS' GraphicsLayer.
 // 13 is roughly "you can see individual streets" — matches Google Maps'
 // transit-stop visibility heuristic.
@@ -332,6 +337,20 @@ export function MetroMap() {
         color,
         vehicle: v,
       });
+    }
+
+    // Sweep stale pins. last_updated is an ISO Z string; anything older
+    // than PIN_STALE_MS gets removed from both the map layer and our index.
+    // Without this, count drifts upward forever as vehicles enter the
+    // bbox, get tracked, leave, and never get replaced.
+    const cutoff = Date.now() - PIN_STALE_MS;
+    for (const [id, pin] of pins) {
+      const lu = pin.vehicle.last_updated;
+      if (!lu) continue;
+      if (Date.parse(lu) < cutoff) {
+        layer.remove(pin.graphic);
+        pins.delete(id);
+      }
     }
 
     setCount(pins.size);

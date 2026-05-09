@@ -30,11 +30,19 @@ function apiBase(): string | null {
   return API_BASE_URL ? API_BASE_URL.replace(/\/$/, '') : null;
 }
 
+// LA Metro runs ~1700 vehicles at peak, ~1100 off-peak. The /vehicles
+// endpoint caps at MAX_LIMIT=1000, which comfortably covers any single
+// city-scale bbox. The default of 500 truncates real data without any
+// signal to the user, so we ask for the cap explicitly.
+const VEHICLES_FETCH_LIMIT = 1000;
+
 export async function fetchVehicles(bbox: BBox, signal?: AbortSignal): Promise<Vehicle[]> {
   const base = apiBase();
   if (!base) return SAMPLE_VEHICLES;
 
-  const qs = `bbox=${bbox.minLon},${bbox.minLat},${bbox.maxLon},${bbox.maxLat}`;
+  const qs =
+    `bbox=${bbox.minLon},${bbox.minLat},${bbox.maxLon},${bbox.maxLat}` +
+    `&limit=${VEHICLES_FETCH_LIMIT}`;
   const url = `${base}/vehicles?${qs}`;
   try {
     const res = await fetch(url, { signal, cache: 'no-store' });
