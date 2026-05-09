@@ -84,6 +84,13 @@ export function MetroMap() {
   const [selectedStopId, setSelectedStopId] = useState<string | null>(null);
   // 'live' = receiving WebSocket frames; 'polling' = fallback. Shown in HUD.
   const [feedMode, setFeedMode] = useState<'live' | 'polling'>('polling');
+  // Filters. Most of the active fleet is deadhead/layover (parked at the
+  // garage, between trips); hide them by default so the map shows what
+  // people actually mean by "buses on the road".
+  const [showOutOfService, setShowOutOfService] = useState(false);
+  const [routeFilter, setRouteFilter] = useState<string>('');
+  const [inServiceCount, setInServiceCount] = useState(0);
+  const [routes, setRoutes] = useState<string[]>([]);
 
   // Init the map once on mount. ArcGIS modules are imported here rather than
   // at module top so they only load in the browser, not at static-export build.
@@ -354,6 +361,45 @@ export function MetroMap() {
     }
 
     setCount(pins.size);
+    applyFilters();
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Filter state is read from a ref inside applyFilters so mergeVehicles
+  // (called from both the WS message handler and the polling tick) can
+  // call us without us having to be in its deps and rerun on every filter
+  // change.
+  const filtersRef = useRef({ showOutOfService, routeFilter });
+  useEffect(() => {
+    filtersRef.current = { showOutOfService, routeFilter };
+    applyFilters();
+  }, [showOutOfService, routeFilter]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const applyFilters = useCallback(() => {
+    const { showOutOfService: showOOS, routeFilter: rf } = filtersRef.current;
+    const pins = pinsRef.current;
+    const routeSet = new Set<string>();
+    let visibleInService = 0;
+    for (const pin of pins.values()) {
+      const v = pin.vehicle;
+      if (v.route_id) routeSet.add(v.route_id);
+      const isInService = !!v.route_id;
+      let visible = true;
+      if (!isInService && !showOOS) visible = false;
+      if (rf && v.route_id !== rf) visible = false;
+      pin.graphic.visible = visible;
+      if (visible && isInService) visibleInService += 1;
+    }
+    setInServiceCount(visibleInService);
+    // Only refresh the dropdown list when it actually changed — sorting
+    // and re-allocating ~240 strings on every batch causes React to
+    // re-render the <select>'s options unnecessarily.
+    setRoutes((prev) => {
+      const next = [...routeSet].sort();
+      if (prev.length === next.length && prev.every((r, i) => r === next[i])) {
+        return prev;
+      }
+      return next;
+    });
   }, []);
 
   // Run a per-frame loop that lerps each pin's geometry from `from` to
@@ -468,15 +514,54 @@ export function MetroMap() {
   return (
     <div className="relative h-screen w-screen">
       <div ref={containerRef} className="h-full w-full" />
-      <div className="pointer-events-none absolute left-4 top-4 rounded bg-black/60 px-3 py-2 text-sm">
-        <div className="font-semibold">LA Metro — Live</div>
-        <div className="opacity-80">
-          {count === null ? 'loading…' : `${count} vehicle${count === 1 ? '' : 's'}`}
+      <div className="absolute left-4 top-4 rounded bg-black/70 px-3 py-2 text-sm space-y-2 backdrop-blur min-w-[200px]">
+        <div>
+          <div className="font-semibold">LA Metro — Live</div>
+          <div className="opacity-80">
+            {count === null ? (
+              'loading…'
+            ) : (
+              <>
+                <span className="font-medium">{inServiceCount}</span> in service{' '}
+                <span className="opacity-60">/ {count} active</span>
+              </>
+            )}
+          </div>
+          <div className="text-xs opacity-60">
+            {feedMode === 'live' ? '● ws' : '○ polling'}
+          </div>
         </div>
-        <div className="text-xs opacity-60">
-          {feedMode === 'live' ? '● ws' : '○ polling'}
+
+        <label className="flex items-center gap-2 text-xs cursor-pointer select-none">
+          <input
+            type="checkbox"
+            checked={showOutOfService}
+            onChange={(e) => setShowOutOfService(e.target.checked)}
+            className="accent-zinc-300"
+          />
+          show deadhead / layover
+        </label>
+
+        <div className="text-xs">
+          <label htmlFor="route-filter" className="block opacity-60 mb-1">
+            route
+          </label>
+          <select
+            id="route-filter"
+            value={routeFilter}
+            onChange={(e) => setRouteFilter(e.target.value)}
+            className="w-full rounded bg-zinc-800 border border-zinc-700 px-2 py-1"
+          >
+            <option value="">all routes</option>
+            {routes.map((r) => (
+              <option key={r} value={r}>
+                {r}
+              </option>
+            ))}
+          </select>
         </div>
-        {error && <div className="text-red-400">err: {error}</div>}
+
+        {error && <div className="text-red-400 text-xs">err: {error}</div>}
       </div>
       {selectedStopId && (
         <StopArrivalsPanel
