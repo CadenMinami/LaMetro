@@ -117,10 +117,52 @@ def test_to_dynamo_item_fills_route_id_from_static_when_rt_missing():
 
 
 def test_seconds_into_service_day_is_local():
-    """Epoch 1700000000 = 2023-11-14 14:13:20 UTC = 06:13:20 LA (PST)."""
+    """Epoch 1700000000 = 2023-11-14 22:13:20 UTC = 14:13:20 LA (PST)."""
     s = handler.seconds_into_service_day(1_700_000_000)
-    # 06:13:20 = 6*3600 + 13*60 + 20 = 22400
-    assert s == 22400
+    # 14:13:20 = 14*3600 + 13*60 + 20 = 51200
+    assert s == 51200
+
+
+def test_compute_delay_handles_owl_trip_after_midnight():
+    """Regression for the late-night service-day bug.
+
+    An owl trip whose schedule is stored as 23:30 → 24:30 (84600 → 88200 in
+    GTFS service-day terms) is genuinely active at LA 00:15. The naive
+    today's-seconds reading (900) is well below the schedule's start (84600),
+    so the deviation algorithm would reject it; but the same wall-clock
+    moment, expressed in *yesterday's* service-day, is 87300 — squarely
+    inside the trip's window. The wrapper must try both candidates.
+    """
+    # 2024-03-15 00:15:00 PDT = 2024-03-15 07:15:00 UTC = 1710486900
+    rt_epoch = 1_710_486_900
+    event = {
+        "vehicle_id": "owl-1",
+        "route_id": "720",
+        "trip_id": "owl-trip",
+        "lat": 34.05,
+        "lon": -118.25,
+        "vehicle_timestamp": rt_epoch,
+        "feed_timestamp": rt_epoch,
+    }
+    fake_gtfs = MagicMock()
+    fake_gtfs.shape_for_trip.return_value = "fake-shape"
+    fake_gtfs.schedule_for_trip.return_value = ((84600, 0.0), (88200, 1000.0))
+
+    # Deviation returns None for today's seconds (out of window) and a real
+    # number for yesterday's-rollover seconds — exercises the both-candidates
+    # path in the wrapper.
+    call_args: list[int] = []
+
+    def fake_compute(*, seconds_into_service_day, **_):
+        call_args.append(seconds_into_service_day)
+        return 45 if seconds_into_service_day >= 86400 else None
+
+    with patch.object(handler.deviation, "compute_delay_seconds", side_effect=fake_compute):
+        delay = handler.compute_delay_for_event(event, fake_gtfs)
+
+    assert delay == 45
+    # Today's candidate was 900s (00:15 LA); yesterday's-rollover was 87300.
+    assert call_args == [900, 87300]
 
 
 def test_lambda_handler_writes_each_valid_record():

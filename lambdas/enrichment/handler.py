@@ -142,13 +142,24 @@ def compute_delay_for_event(
     rt_ts = event.get("vehicle_timestamp") or event.get("feed_timestamp")
     if not rt_ts:
         return None
-    return deviation.compute_delay_seconds(
-        shape=shape,
-        schedule=schedule,
-        vehicle_lat=event["lat"],
-        vehicle_lon=event["lon"],
-        seconds_into_service_day=seconds_into_service_day(int(rt_ts)),
-    )
+    # GTFS encodes trips that cross midnight with stop times >86400 (e.g.
+    # 24:30:00) — they belong to "yesterday's" service day. So a vehicle
+    # active at 00:15 local time should be evaluated against today_s+86400
+    # for those owl trips, but the regular today_s for daytime trips. Try
+    # both candidates and use whichever the deviation algorithm accepts;
+    # only one can fit any given schedule's window.
+    today_s = seconds_into_service_day(int(rt_ts))
+    for candidate_s in (today_s, today_s + 86400):
+        delay = deviation.compute_delay_seconds(
+            shape=shape,
+            schedule=schedule,
+            vehicle_lat=event["lat"],
+            vehicle_lon=event["lon"],
+            seconds_into_service_day=candidate_s,
+        )
+        if delay is not None:
+            return delay
+    return None
 
 
 def to_dynamo_item(
