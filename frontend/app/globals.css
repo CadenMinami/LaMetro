@@ -8,7 +8,18 @@ html, body, #__next {
 
 body {
   margin: 0;
-  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
-  background: #0b0d10;
+  font-family: var(--font-sans), ui-sans-serif, system-ui, -apple-system, sans-serif;
+  background: #0a0c0f;
   color: #e8eaed;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+/* Tighten ArcGIS popup corners + shadow to match the panel. */
+.esri-popup__main-container,
+.esri-popup__header {
+  border-radius: 6px !important;
+}
+.esri-popup__main-container {
+  box-shadow: 0 18px 40px -12px rgba(0, 0, 0, 0.6) !important;
 }

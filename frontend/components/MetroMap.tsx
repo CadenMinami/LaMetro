@@ -53,9 +53,10 @@ interface AnimatedPin {
   toLon: number;
   toLat: number;
   startedAt: number | null;
-  // Last-seen color so we don't rebuild the symbol object on every event
-  // when nothing changed visually.
-  color: string;
+  // Two-tone: fill encodes schedule deviation, outline encodes route id.
+  // Stored so we skip symbol mutations when neither has changed.
+  fillColor: string;
+  outlineColor: string;
   // Most recent vehicle payload, kept around for popup re-rendering on click.
   vehicle: Vehicle;
 }
@@ -272,8 +273,12 @@ export function MetroMap() {
       if (!id) continue;
 
       const outOfService = !v.route_id;
+      // Two-tone pin: fill = schedule deviation (gray when no data),
+      // outline = route id. Lets a single pin encode both signals so the
+      // legend stays consistent — every fill on the map matches a swatch.
       const dColor = delayColor(v.delay_seconds);
-      const color = outOfService ? '#888888' : dColor ?? routeColor(v.route_id);
+      const fillColor = outOfService ? '#71717a' : dColor ?? '#71717a';
+      const outlineColor = outOfService ? '#3f3f46' : routeColor(v.route_id);
       const mph = typeof v.speed_mps === 'number' ? (v.speed_mps * 2.23694).toFixed(1) : '—';
       const delayText = delayLabel(v.delay_seconds);
       const bearingText = bearingCompass(v.bearing);
@@ -305,12 +310,17 @@ export function MetroMap() {
         existing.toLat = v.lat;
         existing.startedAt = now;
         existing.vehicle = v;
-        if (existing.color !== color) {
-          existing.color = color;
-          // SimpleMarkerSymbol exposes `color` as a settable property; mutate
-          // it in place rather than replacing the whole symbol object so TS
-          // doesn't have to reason about the SymbolProperties union.
-          (existing.graphic.symbol as __esri.SimpleMarkerSymbol).color = color as unknown as __esri.Color;
+        // SimpleMarkerSymbol exposes `color` and `outline` as settable
+        // properties; mutate in place rather than rebuilding the symbol so
+        // TS doesn't have to reason about the SymbolProperties union.
+        const sym = existing.graphic.symbol as __esri.SimpleMarkerSymbol;
+        if (existing.fillColor !== fillColor) {
+          existing.fillColor = fillColor;
+          sym.color = fillColor as unknown as __esri.Color;
+        }
+        if (existing.outlineColor !== outlineColor) {
+          existing.outlineColor = outlineColor;
+          sym.outline.color = outlineColor as unknown as __esri.Color;
         }
         existing.graphic.attributes = attrs;
         continue;
@@ -320,9 +330,10 @@ export function MetroMap() {
         geometry: { type: 'point', longitude: v.lon, latitude: v.lat },
         symbol: {
           type: 'simple-marker',
-          color,
-          size: 8,
-          outline: { color: '#0b0d10', width: 1 },
+          color: fillColor,
+          size: 10,
+          // Outline is the route signal — wide enough to read at 10px size.
+          outline: { color: outlineColor, width: 2 },
         },
         attributes: attrs,
         popupTemplate: {
@@ -341,7 +352,8 @@ export function MetroMap() {
         toLon: v.lon,
         toLat: v.lat,
         startedAt: null,
-        color,
+        fillColor,
+        outlineColor,
         vehicle: v,
       });
     }
@@ -512,74 +524,122 @@ export function MetroMap() {
   const selectedStop = selectedStopId ? stopsIndexRef.current?.get(selectedStopId) ?? null : null;
 
   return (
-    <div className="relative h-screen w-screen">
+    <div className="relative h-screen w-screen overflow-hidden">
       <div ref={containerRef} className="h-full w-full" />
-      <div className="absolute left-4 top-4 rounded bg-black/70 px-3 py-2 text-sm space-y-2 backdrop-blur min-w-[200px]">
-        <div>
-          <div className="font-semibold">LA Metro — Live</div>
-          <div className="opacity-80">
-            {count === null ? (
-              'loading…'
-            ) : (
-              <>
-                <span className="font-medium">{inServiceCount}</span> in service{' '}
-                <span className="opacity-60">/ {count} active</span>
-              </>
-            )}
-          </div>
-          <div className="text-xs opacity-60">
-            {feedMode === 'live' ? '● ws' : '○ polling'}
-          </div>
-        </div>
 
-        <label className="flex items-center gap-2 text-xs cursor-pointer select-none">
-          <input
-            type="checkbox"
-            checked={showOutOfService}
-            onChange={(e) => setShowOutOfService(e.target.checked)}
-            className="accent-zinc-300"
-          />
-          show deadhead / layover
-        </label>
+      {/* Sidebar panel. Sentence-case sans labels, mono reserved for
+          numeric values only — keeps the panel feeling like a tool rather
+          than a sci-fi HUD. */}
+      <div className="pointer-events-none absolute inset-0 p-4 sm:p-5">
+        <div
+          className="pointer-events-auto w-[280px] overflow-hidden rounded-lg
+                     border border-white/10 bg-black/70 text-zinc-100 shadow-xl
+                     shadow-black/40 backdrop-blur-xl"
+        >
+          {/* Header — wordmark + live state pill. */}
+          <div className="flex items-center justify-between gap-2 px-4 pt-4 pb-3">
+            <div className="text-[15px] font-semibold leading-none tracking-tight">
+              LA Metro Live
+            </div>
+            <FeedPill mode={feedMode} />
+          </div>
 
-        <div className="text-xs">
-          <label htmlFor="route-filter" className="block opacity-60 mb-1">
-            route ({routes.length})
-          </label>
-          <div className="flex gap-1">
-            <input
-              id="route-filter"
-              list="route-options"
-              type="text"
-              value={routeFilter}
-              onChange={(e) => setRouteFilter(e.target.value)}
-              placeholder="all routes — type to filter"
-              className="w-full rounded bg-zinc-800 border border-zinc-700 px-2 py-1
-                         placeholder:text-zinc-500 focus:outline-none focus:border-zinc-500"
-              autoComplete="off"
-              spellCheck={false}
-            />
-            {routeFilter && (
-              <button
-                type="button"
-                onClick={() => setRouteFilter('')}
-                className="rounded bg-zinc-800 border border-zinc-700 px-2
-                           text-zinc-300 hover:bg-zinc-700"
-                aria-label="clear route filter"
+          {/* Primary stat — fleet count. */}
+          <div className="border-t border-white/[0.06] px-4 py-3.5">
+            <div className="font-mono text-[28px] font-medium leading-none tabular-nums tracking-tight">
+              {count === null ? '—' : inServiceCount.toLocaleString()}
+            </div>
+            <div className="mt-1.5 text-[12px] text-zinc-400">
+              vehicles in service
+              {count !== null && (
+                <span className="text-zinc-500">
+                  {' '}· <span className="tabular-nums">{count.toLocaleString()}</span> active
+                </span>
+              )}
+            </div>
+          </div>
+
+          {/* Filters */}
+          <div className="space-y-3 border-t border-white/[0.06] px-4 py-3.5">
+            <label className="flex cursor-pointer select-none items-center gap-2 text-[12px]
+                              text-zinc-300 transition-colors hover:text-white">
+              <input
+                type="checkbox"
+                checked={showOutOfService}
+                onChange={(e) => setShowOutOfService(e.target.checked)}
+                className="h-3.5 w-3.5 cursor-pointer accent-zinc-400"
+              />
+              Show deadhead / layover
+            </label>
+
+            <div>
+              <label
+                htmlFor="route-filter"
+                className="mb-1.5 block text-[12px] text-zinc-400"
               >
-                ×
-              </button>
-            )}
+                Route{' '}
+                <span className="text-zinc-500">
+                  (<span className="tabular-nums">{routes.length}</span> active)
+                </span>
+              </label>
+              <div className="flex gap-1.5">
+                <input
+                  id="route-filter"
+                  list="route-options"
+                  type="text"
+                  value={routeFilter}
+                  onChange={(e) => setRouteFilter(e.target.value)}
+                  placeholder="All routes"
+                  className="w-full rounded border border-white/10 bg-white/[0.04] px-2 py-1.5
+                             text-[13px] text-zinc-100 transition-colors
+                             placeholder:text-zinc-500
+                             focus:border-white/25 focus:bg-white/[0.06] focus:outline-none"
+                  autoComplete="off"
+                  spellCheck={false}
+                />
+                {routeFilter && (
+                  <button
+                    type="button"
+                    onClick={() => setRouteFilter('')}
+                    className="rounded border border-white/10 bg-white/[0.04] px-2 text-zinc-400
+                               transition-colors hover:bg-white/10 hover:text-white"
+                    aria-label="Clear route filter"
+                  >
+                    ×
+                  </button>
+                )}
+              </div>
+              <datalist id="route-options">
+                {routes.map((r) => (
+                  <option key={r} value={r} />
+                ))}
+              </datalist>
+            </div>
           </div>
-          <datalist id="route-options">
-            {routes.map((r) => (
-              <option key={r} value={r} />
-            ))}
-          </datalist>
-        </div>
 
-        {error && <div className="text-red-400 text-xs">err: {error}</div>}
+          {/* Delay legend. Pin fill = deviation, pin outline = route id. */}
+          <div className="border-t border-white/[0.06] px-4 py-3.5">
+            <div className="mb-2 text-[12px] text-zinc-400">Schedule deviation</div>
+            <div className="grid grid-cols-2 gap-x-3 gap-y-1.5 text-[12px] text-zinc-300">
+              <LegendDot color="#22c55e" label="On time" />
+              <LegendDot color="#eab308" label="1–3 min" />
+              <LegendDot color="#f97316" label="3–5 min" />
+              <LegendDot color="#ef4444" label="5+ min" />
+              <LegendDot color="#71717a" label="No data" />
+            </div>
+            <div className="mt-2 text-[11px] leading-snug text-zinc-500">
+              Pin outline color identifies the route.
+            </div>
+          </div>
+
+          {error && (
+            <div className="border-t border-red-500/20 bg-red-500/[0.06] px-4 py-2 text-[12px] text-red-300">
+              <span className="text-red-400">Error:</span> {error}
+            </div>
+          )}
+        </div>
       </div>
+
       {selectedStopId && (
         <StopArrivalsPanel
           stopId={selectedStopId}
@@ -591,65 +651,103 @@ export function MetroMap() {
   );
 }
 
+// Live/Polling indicator pill. Amber when the WebSocket is feeding events
+// (the dispatcher-console "active" color), neutral when we've fallen back
+// to polling. Pulse dot draws the eye to the state without being noisy.
+function FeedPill({ mode }: { mode: 'live' | 'polling' }) {
+  const live = mode === 'live';
+  return (
+    <span
+      className={`inline-flex items-center gap-1.5 text-[11px]
+                  ${live ? 'text-emerald-300/90' : 'text-zinc-500'}`}
+    >
+      <span
+        className={`h-1.5 w-1.5 rounded-full ${
+          live ? 'bg-emerald-400 animate-pulse-dot' : 'bg-zinc-500'
+        }`}
+        aria-hidden
+      />
+      {live ? 'live' : 'polling'}
+    </span>
+  );
+}
+
+function LegendDot({ color, label }: { color: string; label: string }) {
+  return (
+    <div className="flex items-center gap-2">
+      <span
+        className="h-2 w-2 rounded-full"
+        style={{ background: color }}
+        aria-hidden
+      />
+      <span>{label}</span>
+    </div>
+  );
+}
+
 // Build a richer info card for the vehicle popup. Returns a real
 // HTMLElement so we can compute relative time at open-time (the {token}
 // templating ArcGIS supports is static).
 function vehiclePopupContent(target: { graphic: __esri.Graphic }): HTMLElement {
   const a = target.graphic.attributes ?? {};
+  const SANS = 'var(--font-sans), ui-sans-serif, system-ui, sans-serif';
+  const MONO = 'var(--font-mono), ui-monospace, SFMono-Regular, Menlo, monospace';
+
   const root = document.createElement('div');
   root.style.cssText =
-    'font-family: system-ui, -apple-system, sans-serif; font-size: 13px;' +
-    'min-width: 220px; line-height: 1.45;';
+    `font-family: ${SANS}; font-size: 13px; min-width: 240px; line-height: 1.5; color: #e8eaed;`;
 
   const delaySec: number | null = typeof a.delay_seconds === 'number' ? a.delay_seconds : null;
   const delayPillColor = delayColor(delaySec) ?? '#52525b';
   const delayPillText = delayLabel(delaySec);
 
-  // Top row: delay pill + speed
+  // Top row: delay pill + speed readout
   const top = document.createElement('div');
-  top.style.cssText = 'display: flex; gap: 8px; align-items: center; margin-bottom: 8px;';
+  top.style.cssText = 'display: flex; gap: 10px; align-items: center; margin-bottom: 12px;';
   const pill = document.createElement('span');
   pill.textContent = delayPillText;
   pill.style.cssText =
-    `background: ${delayPillColor}; color: #0b0d10; padding: 2px 8px;` +
-    'border-radius: 999px; font-weight: 600; font-size: 12px;';
+    `background: ${delayPillColor}; color: #0a0c0f; padding: 2px 9px;` +
+    `border-radius: 999px; font-weight: 600; font-size: 11px;`;
   top.appendChild(pill);
   const speed = document.createElement('span');
+  speed.style.cssText = `font-family: ${MONO}; font-size: 12px; color: #a1a1aa; font-variant-numeric: tabular-nums;`;
   speed.textContent = `${a.mph} mph`;
-  speed.style.cssText = 'opacity: 0.7;';
   top.appendChild(speed);
   root.appendChild(top);
 
-  // Detail rows.
-  const rows: Array<[string, string]> = [
-    ['Vehicle', String(a.vehicle_id ?? '—')],
-    ['Trip', a.trip_id ? String(a.trip_id) : '—'],
-    ['Heading', String(a.bearing_text ?? '—')],
-    ['Updated', timeAgo(a.last_updated)],
+  // Detail rows. Sentence-case sans labels; mono only on identifier values
+  // so digits line up.
+  const rows: Array<[string, string, boolean]> = [
+    ['Vehicle', String(a.vehicle_id ?? '—'), true],
+    ['Trip', a.trip_id ? String(a.trip_id) : '—', true],
+    ['Heading', String(a.bearing_text ?? '—'), false],
+    ['Updated', timeAgo(a.last_updated), false],
   ];
-  for (const [k, v] of rows) {
+  for (const [k, v, valueIsMono] of rows) {
     const row = document.createElement('div');
-    row.style.cssText = 'display: flex; gap: 8px; margin-top: 2px;';
+    row.style.cssText = 'display: flex; gap: 12px; margin-top: 3px; align-items: baseline;';
     const key = document.createElement('span');
     key.textContent = k;
-    key.style.cssText = 'opacity: 0.55; min-width: 60px;';
+    key.style.cssText = 'font-size: 12px; color: #a1a1aa; min-width: 64px;';
     const val = document.createElement('span');
     val.textContent = v;
-    if (k === 'Trip' && v !== '—') {
-      val.style.cssText = 'font-family: ui-monospace, SFMono-Regular, Menlo, monospace;';
-    }
+    val.style.cssText = valueIsMono
+      ? `font-family: ${MONO}; font-size: 12px; color: #e8eaed; font-variant-numeric: tabular-nums;`
+      : `font-size: 13px; color: #e8eaed;`;
     row.appendChild(key);
     row.appendChild(val);
     root.appendChild(row);
   }
 
-  // Footer link to route detail page.
   if (a.route_href) {
     const link = document.createElement('a');
     link.href = String(a.route_href);
-    link.textContent = '→ route detail';
+    link.textContent = 'Route detail →';
     link.style.cssText =
-      'display: inline-block; margin-top: 10px; color: #60a5fa; text-decoration: none;';
+      'display: inline-block; margin-top: 12px; font-size: 13px; color: #93c5fd; text-decoration: none;';
+    link.onmouseenter = () => { link.style.textDecoration = 'underline'; };
+    link.onmouseleave = () => { link.style.textDecoration = 'none'; };
     root.appendChild(link);
   }
 
