@@ -23,6 +23,8 @@ export interface ProcessingStackProps extends cdk.StackProps {
   // and wire the callback URL through env.
   websocketConnectionsTable: dynamodb.ITable;
   websocketStack: WebSocketStack;
+  geofencesTable: dynamodb.ITable;
+  notificationsTable: dynamodb.ITable;
 }
 
 /**
@@ -124,6 +126,9 @@ export class ProcessingStack extends cdk.Stack {
       environment: {
         HOT_VEHICLES_TABLE_NAME: props.hotVehiclesTable.tableName,
         ROUTE_AGGREGATES_TABLE_NAME: props.routeAggregatesTable.tableName,
+        GEOFENCES_TABLE_NAME: props.geofencesTable.tableName,
+        GEOFENCES_ROUTE_GSI: 'route_id-index',
+        NOTIFICATIONS_TABLE_NAME: props.notificationsTable.tableName,
       },
       logGroup: aggLogGroup,
       description: 'Phase 4b: rolling per-route stats every minute.',
@@ -131,6 +136,10 @@ export class ProcessingStack extends cdk.Stack {
 
     props.hotVehiclesTable.grantReadData(aggregationFn);
     props.routeAggregatesTable.grantWriteData(aggregationFn);
+    // Phase 6: read+update geofences (GSI read + cooldown stamp) and write
+    // notifications when a route breaches a user's threshold.
+    props.geofencesTable.grantReadWriteData(aggregationFn);
+    props.notificationsTable.grantWriteData(aggregationFn);
 
     // EventBridge: rate(1 minute). Cron would also work but rate is simpler
     // for "every N minutes" without needing AWS's UTC cron expressions.

@@ -22,7 +22,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable
 
 import boto3
-from boto3.dynamodb.conditions import Attr
+from boto3.dynamodb.conditions import Attr, Key
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -35,6 +35,11 @@ TTL_DAYS = int(os.environ.get("AGGREGATE_TTL_DAYS", "7"))
 # A vehicle is "on time" if its delay is in [-60s, +60s]. Keep this configurable
 # so we can revisit once we see the real delay distribution.
 ON_TIME_TOLERANCE_SECONDS = int(os.environ.get("ON_TIME_TOLERANCE_SECONDS", "60"))
+GEOFENCES_TABLE = os.environ.get("GEOFENCES_TABLE_NAME", "")
+GEOFENCES_ROUTE_GSI = os.environ.get("GEOFENCES_ROUTE_GSI", "route_id-index")
+NOTIFICATIONS_TABLE = os.environ.get("NOTIFICATIONS_TABLE_NAME", "")
+ALERT_COOLDOWN_SECONDS = int(os.environ.get("ALERT_COOLDOWN_SECONDS", "900"))  # 15 min
+NOTIFICATION_TTL_DAYS = int(os.environ.get("NOTIFICATION_TTL_DAYS", "7"))
 
 _ddb_resource = None
 
@@ -175,6 +180,84 @@ def write_aggregates(
     return written
 
 
+def geofence_breaches(
+    geofences: Iterable[dict[str, Any]],
+    avg_delay: int,
+    now_epoch: int,
+    cooldown: int = ALERT_COOLDOWN_SECONDS,
+) -> list[dict[str, Any]]:
+    """Pure decision: which geofences should fire for this route right now?
+
+    A geofence fires when it is enabled, the route's avg delay exceeds its
+    threshold, and its cooldown window has elapsed since the last alert.
+    """
+    out: list[dict[str, Any]] = []
+    for gf in geofences:
+        if not gf.get("enabled", False):
+            continue
+        threshold = _to_int(gf.get("threshold_seconds"))
+        if threshold is None or avg_delay <= threshold:
+            continue
+        last = _to_int(gf.get("last_alerted_epoch")) or 0
+        if now_epoch - last < cooldown:
+            continue
+        out.append(gf)
+    return out
+
+
+def build_notification_item(
+    user_id: str, route_id: str, avg_delay: int, threshold: int, now: datetime
+) -> dict[str, Any]:
+    minutes = round(avg_delay / 60)
+    return {
+        "user_id": user_id,
+        "created_at": now.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+        "route_id": route_id,
+        "delay_seconds": avg_delay,
+        "threshold_seconds": threshold,
+        "message": f"Route {route_id} is running ~{minutes} min late "
+                   f"(over your {round(threshold / 60)} min alert).",
+        "read": False,
+        "ttl_epoch": int((now + timedelta(days=NOTIFICATION_TTL_DAYS)).timestamp()),
+    }
+
+
+def evaluate_geofences(
+    geofences_table,
+    notifications_table,
+    aggregates: dict[str, dict[str, Any]],
+    now: datetime,
+) -> int:
+    """For each route with a real avg delay, find breaching geofences, write a
+    notification per breach, and stamp last_alerted_epoch. Returns alert count.
+    """
+    now_epoch = int(now.timestamp())
+    fired = 0
+    for route_id, agg in aggregates.items():
+        avg_delay = agg.get("avg_delay_seconds")
+        if avg_delay is None:
+            continue
+        resp = geofences_table.query(
+            IndexName=GEOFENCES_ROUTE_GSI,
+            KeyConditionExpression=Key("route_id").eq(route_id),
+        )
+        breaches = geofence_breaches(resp.get("Items", []), int(avg_delay), now_epoch)
+        for gf in breaches:
+            threshold = _to_int(gf.get("threshold_seconds")) or 0
+            notifications_table.put_item(
+                Item=build_notification_item(
+                    gf["user_id"], route_id, int(avg_delay), threshold, now
+                )
+            )
+            geofences_table.update_item(
+                Key={"user_id": gf["user_id"], "geofence_id": gf["geofence_id"]},
+                UpdateExpression="SET last_alerted_epoch = :e",
+                ExpressionAttributeValues={":e": now_epoch},
+            )
+            fired += 1
+    return fired
+
+
 def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     started = time.monotonic()
     if not HOT_TABLE or not AGG_TABLE:
@@ -193,6 +276,19 @@ def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     aggregates = aggregate_by_route(vehicles)
     written = write_aggregates(agg_table, aggregates, window_start)
 
+    alerts_fired = 0
+    if GEOFENCES_TABLE and NOTIFICATIONS_TABLE:
+        try:
+            alerts_fired = evaluate_geofences(
+                get_table(GEOFENCES_TABLE),
+                get_table(NOTIFICATIONS_TABLE),
+                aggregates,
+                now,
+            )
+        except Exception:
+            # Alerting must never take down the aggregation cycle.
+            logger.exception("geofence_evaluation_failed")
+
     elapsed_ms = int((time.monotonic() - started) * 1000)
     log = {
         "ok": True,
@@ -200,6 +296,7 @@ def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
         "window_start": iso_z(window_start),
         "vehicles_in_window": len(vehicles),
         "routes_written": written,
+        "alerts_fired": alerts_fired,
     }
     logger.info(json.dumps(log))
     return log

@@ -60,6 +60,8 @@ const processing = new ProcessingStack(app, 'LaMetro-ProcessingStack', {
   archiveBucket: storage.archiveBucket,
   websocketConnectionsTable: storage.websocketConnectionsTable,
   websocketStack: websocket,
+  geofencesTable: storage.geofencesTable,
+  notificationsTable: storage.notificationsTable,
   description:
     'Processing: Enrichment (Kinesis → DDB + delay + WebSocket fan-out) + Aggregation (1m).',
 });
