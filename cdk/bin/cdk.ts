@@ -76,7 +76,7 @@ const api = new ApiStack(app, 'LaMetro-ApiStack', {
   geofencesTable: storage.geofencesTable,
   notificationsTable: storage.notificationsTable,
   description:
-    'Read API: /vehicles, /routes/{id}/aggregates, /stops, /stops/{id}/arrivals.',
+    'Read API (/vehicles, /routes, /stops) + Cognito-authorized user API (/geofences, /notifications, /me).',
 });
 
 const frontend = new FrontendStack(app, 'LaMetro-FrontendStack', {

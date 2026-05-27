@@ -57,8 +57,12 @@ function AccountInner() {
   }
 
   async function onDelete(id: string) {
-    await deleteGeofence(id);
-    await refresh();
+    try {
+      await deleteGeofence(id);
+      await refresh();
+    } catch (e) {
+      setError((e as Error).message);
+    }
   }
 
   async function onToggleEmail() {

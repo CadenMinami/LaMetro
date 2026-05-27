@@ -29,6 +29,11 @@ export interface ApiStackProps extends cdk.StackProps {
  *   GET /stops                           (Phase 4d)
  *   GET /stops/{stopId}/arrivals         (Phase 4d)
  *
+ *   Phase 6 (Cognito-authorized):
+ *   GET/POST   /geofences,  DELETE /geofences/{id}
+ *   GET        /notifications,  PATCH /notifications/{id}
+ *   GET/PUT    /me
+ *
  * Backed by a Query Lambda + REST API Gateway. CORS open to '*' for now —
  * tighten to specific origins in Phase 9.
  */
