@@ -8,6 +8,7 @@ import { ProcessingStack } from '../lib/processing-stack';
 import { ApiStack } from '../lib/api-stack';
 import { FrontendStack } from '../lib/frontend-stack';
 import { WebSocketStack } from '../lib/websocket-stack';
+import { AuthStack } from '../lib/auth-stack';
 
 const app = new cdk.App();
 
@@ -36,6 +37,12 @@ const ingestion = new IngestionStack(app, 'LaMetro-IngestionStack', {
   description: 'LA Metro GTFS-RT ingestion Lambda + EventBridge schedule.',
 });
 
+const auth = new AuthStack(app, 'LaMetro-AuthStack', {
+  env,
+  usersTable: storage.usersTable,
+  description: 'Phase 6: Cognito user pool + PostConfirmation trigger.',
+});
+
 // WebSocketStack must be constructed *before* ProcessingStack so we can
 // pass the callback URL + grantManageConnections() into the enrichment
 // Lambda for Phase 5b fan-out.
@@ -62,6 +69,10 @@ const api = new ApiStack(app, 'LaMetro-ApiStack', {
   hotVehiclesTable: storage.hotVehiclesTable,
   routeAggregatesTable: storage.routeAggregatesTable,
   archiveBucket: storage.archiveBucket,
+  userPool: auth.userPool,
+  usersTable: storage.usersTable,
+  geofencesTable: storage.geofencesTable,
+  notificationsTable: storage.notificationsTable,
   description:
     'Read API: /vehicles, /routes/{id}/aggregates, /stops, /stops/{id}/arrivals.',
 });
@@ -81,7 +92,7 @@ const billing = new BillingStack(app, 'LaMetro-BillingStack', {
   description: 'Cost guardrails: SNS-backed CloudWatch billing alarms + monthly Budget.',
 });
 
-for (const stack of [storage, ingestion, processing, api, frontend, websocket, billing]) {
+for (const stack of [storage, auth, ingestion, processing, api, frontend, websocket, billing]) {
   for (const [k, v] of Object.entries(tags)) {
     cdk.Tags.of(stack).add(k, v);
   }

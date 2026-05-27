@@ -6,6 +6,7 @@ import * as logs from 'aws-cdk-lib/aws-logs';
 import * as apigw from 'aws-cdk-lib/aws-apigateway';
 import * as dynamodb from 'aws-cdk-lib/aws-dynamodb';
 import * as s3 from 'aws-cdk-lib/aws-s3';
+import * as cognito from 'aws-cdk-lib/aws-cognito';
 
 export interface ApiStackProps extends cdk.StackProps {
   hotVehiclesTable: dynamodb.ITable;
@@ -14,6 +15,11 @@ export interface ApiStackProps extends cdk.StackProps {
   // arrivals API loads. The Lambda only needs read access under the
   // `gtfs-static/` prefix.
   archiveBucket: s3.IBucket;
+  // Phase 6: authenticated user-api dependencies.
+  userPool: cognito.IUserPool;
+  usersTable: dynamodb.ITable;
+  geofencesTable: dynamodb.ITable;
+  notificationsTable: dynamodb.ITable;
 }
 
 /**
@@ -88,8 +94,8 @@ export class ApiStack extends cdk.Stack {
       },
       defaultCorsPreflightOptions: {
         allowOrigins: apigw.Cors.ALL_ORIGINS,
-        allowMethods: ['GET', 'OPTIONS'],
-        allowHeaders: ['Content-Type'],
+        allowMethods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+        allowHeaders: ['Content-Type', 'Authorization'],
       },
     });
 
@@ -108,6 +114,67 @@ export class ApiStack extends cdk.Stack {
     const stopById = stops.addResource('{stopId}');
     const arrivals = stopById.addResource('arrivals');
     arrivals.addMethod('GET');
+
+    // ----- Phase 6: authenticated user-api -----
+    const userApiName = 'la-metro-user-api';
+    const userApiLogGroup = new logs.LogGroup(this, 'UserApiFnLogs', {
+      logGroupName: `/aws/lambda/${userApiName}`,
+      retention: logs.RetentionDays.ONE_WEEK,
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+    });
+
+    const userApiFn = new lambda.Function(this, 'UserApiFn', {
+      functionName: userApiName,
+      runtime: lambda.Runtime.PYTHON_3_12,
+      architecture: lambda.Architecture.ARM_64,
+      handler: 'handler.lambda_handler',
+      code: lambda.Code.fromAsset(
+        path.join(__dirname, '..', '..', 'lambdas', 'user_api', '.build'),
+      ),
+      memorySize: 256,
+      timeout: cdk.Duration.seconds(10),
+      environment: {
+        USERS_TABLE_NAME: props.usersTable.tableName,
+        GEOFENCES_TABLE_NAME: props.geofencesTable.tableName,
+        NOTIFICATIONS_TABLE_NAME: props.notificationsTable.tableName,
+      },
+      logGroup: userApiLogGroup,
+      description: 'Phase 6: authenticated geofence CRUD, notifications, prefs.',
+    });
+    props.usersTable.grantReadWriteData(userApiFn);
+    props.geofencesTable.grantReadWriteData(userApiFn);
+    props.notificationsTable.grantReadWriteData(userApiFn);
+
+    // Cognito User Pool authorizer — validates the JWT and exposes claims at
+    // event.requestContext.authorizer.claims for the Lambda.
+    const authorizer = new apigw.CognitoUserPoolsAuthorizer(this, 'UserPoolAuthorizer', {
+      cognitoUserPools: [props.userPool],
+      authorizerName: 'la-metro-cognito',
+    });
+
+    const userIntegration = new apigw.LambdaIntegration(userApiFn);
+    const authMethodOptions: apigw.MethodOptions = {
+      authorizer,
+      authorizationType: apigw.AuthorizationType.COGNITO,
+    };
+
+    // /geofences and /geofences/{geofenceId}
+    const geofences = api.root.addResource('geofences');
+    geofences.addMethod('GET', userIntegration, authMethodOptions);
+    geofences.addMethod('POST', userIntegration, authMethodOptions);
+    const geofenceById = geofences.addResource('{geofenceId}');
+    geofenceById.addMethod('DELETE', userIntegration, authMethodOptions);
+
+    // /notifications and /notifications/{notificationId}
+    const notifications = api.root.addResource('notifications');
+    notifications.addMethod('GET', userIntegration, authMethodOptions);
+    const notificationById = notifications.addResource('{notificationId}');
+    notificationById.addMethod('PATCH', userIntegration, authMethodOptions);
+
+    // /me
+    const me = api.root.addResource('me');
+    me.addMethod('GET', userIntegration, authMethodOptions);
+    me.addMethod('PUT', userIntegration, authMethodOptions);
 
     new cdk.CfnOutput(this, 'ApiUrl', {
       value: api.url,
