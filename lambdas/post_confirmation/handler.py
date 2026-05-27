@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 import boto3
+from botocore.exceptions import ClientError
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -21,12 +22,6 @@ logger.setLevel(logging.INFO)
 USERS_TABLE = os.environ.get("USERS_TABLE_NAME", "")
 
 _ddb = None
-
-
-# Aliased so tests can construct the boto3 client exception without a live
-# client. boto3 raises botocore.exceptions.ClientError; we match on the code.
-class ConditionalCheckFailed(Exception):
-    pass
 
 
 def get_table(name: str):
@@ -60,13 +55,8 @@ def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
             # (which would reset the user's email preference).
             ConditionExpression="attribute_not_exists(user_id)",
         )
-    except ConditionalCheckFailed:
-        logger.info("user row already exists for %s", user_id)
-    except Exception as exc:  # pragma: no cover - defensive
-        code = getattr(getattr(exc, "response", {}), "get", lambda *_: None)(
-            "Error", {}
-        )
-        if isinstance(code, dict) and code.get("Code") == "ConditionalCheckFailedException":
+    except ClientError as exc:
+        if exc.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
             logger.info("user row already exists for %s", user_id)
         else:
             # Never fail the trigger — log and move on so the user can sign in.

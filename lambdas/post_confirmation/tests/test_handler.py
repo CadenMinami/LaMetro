@@ -35,11 +35,32 @@ def test_seeds_user_row_with_defaults(monkeypatch):
 
 
 def test_swallows_conditional_check_failure(monkeypatch):
-    # A repeat confirmation (same sub) must not fail the trigger — that would
-    # block the user from signing in.
+    # A repeat confirmation (same sub) raises ConditionalCheckFailedException —
+    # this must NOT fail the trigger, or the user can't sign in.
+    from botocore.exceptions import ClientError
+
     table = MagicMock()
-    err = handler.ConditionalCheckFailed()
-    table.put_item.side_effect = err
+    table.put_item.side_effect = ClientError(
+        {"Error": {"Code": "ConditionalCheckFailedException", "Message": "exists"}},
+        "PutItem",
+    )
+    monkeypatch.setattr(handler, "get_table", lambda name: table)
+    monkeypatch.setattr(handler, "USERS_TABLE", "fake-users")
+
+    event = _event()
+    assert handler.lambda_handler(event, MagicMock()) is event
+
+
+def test_swallows_unexpected_client_error(monkeypatch):
+    # Any other DynamoDB error must also be swallowed — a failed seed should
+    # never block the user from signing in.
+    from botocore.exceptions import ClientError
+
+    table = MagicMock()
+    table.put_item.side_effect = ClientError(
+        {"Error": {"Code": "ProvisionedThroughputExceededException", "Message": "slow down"}},
+        "PutItem",
+    )
     monkeypatch.setattr(handler, "get_table", lambda name: table)
     monkeypatch.setattr(handler, "USERS_TABLE", "fake-users")
 
