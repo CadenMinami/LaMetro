@@ -47,3 +47,15 @@ Phase 1 is currently pointed at the **MTA NYC subway** GTFS-RT feed (public, no 
 ## Cost discipline
 
 Hard cap: $30/month during active development, $15/month idle. CloudWatch billing alarm at $20, AWS Budget at $30. All resources tagged `Project=la-metro` for Cost Explorer filtering. `cdk destroy` everything during long breaks.
+
+## Future work
+
+### Phase 6 follow-ups
+- **Email alerts:** the per-user "email me" toggle is built and persisted; wiring
+  it to SES (or SNS→Lambda→SES) is the remaining step. Deferred to avoid the SES
+  sandbox during the build.
+- **Per-stop directional geofences:** geofences currently fire on a route's
+  average delay. The `stop_id` field is reserved so alerts can later target the
+  next vehicle approaching a specific stop in the user's direction.
+- **Real-time alert push:** notifications are polled every 60s; they could ride
+  the existing WebSocket for instant delivery once the socket is authenticated.
