@@ -144,3 +144,37 @@ def test_put_me_updates_email_toggle(monkeypatch):
     kwargs = table.update_item.call_args.kwargs
     assert kwargs["Key"] == {"user_id": "user-1"}
     assert kwargs["ExpressionAttributeValues"][":v"] is True
+
+
+def test_put_me_rejects_non_bool(monkeypatch):
+    # A JSON string "false" must not be coerced to True (silent enable bug).
+    table = MagicMock()
+    monkeypatch.setattr(handler, "_users", lambda: table)
+    resp = handler.lambda_handler(
+        _event("/me", "PUT", body={"email_alerts_enabled": "false"}), MagicMock()
+    )
+    assert resp["statusCode"] == 400
+    table.update_item.assert_not_called()
+
+
+def test_put_me_rejects_missing_key(monkeypatch):
+    table = MagicMock()
+    monkeypatch.setattr(handler, "_users", lambda: table)
+    resp = handler.lambda_handler(_event("/me", "PUT", body={}), MagicMock())
+    assert resp["statusCode"] == 400
+    table.update_item.assert_not_called()
+
+
+def test_get_me_falls_back_when_absent(monkeypatch):
+    # No row yet (PostConfirmation hasn't run / race): synthesize defaults
+    # from the Cognito email claim.
+    table = MagicMock()
+    table.get_item.return_value = {}  # no "Item"
+    monkeypatch.setattr(handler, "_users", lambda: table)
+    resp = handler.lambda_handler(_event("/me", "GET", sub="user-9"), MagicMock())
+    assert resp["statusCode"] == 200
+    body = json.loads(resp["body"])
+    assert body["user_id"] == "user-9"
+    assert body["email"] == "r@x.com"
+    assert body["email_alerts_enabled"] is False
+    assert body["home_routes"] == []
