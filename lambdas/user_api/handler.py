@@ -117,10 +117,6 @@ def _parse_body(event: dict[str, Any]) -> dict:
         return {}
 
 
-def _iso_micro(now: datetime) -> str:
-    return now.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
-
-
 # ----- /geofences -----
 
 def list_geofences(user_id: str) -> dict:
@@ -214,7 +210,9 @@ def get_me(user_id: str, email: str) -> dict:
 
 
 def put_me(user_id: str, body: dict) -> dict:
-    enabled = bool(body.get("email_alerts_enabled"))
+    enabled = body.get("email_alerts_enabled")
+    if not isinstance(enabled, bool):
+        return _response(400, {"error": "invalid_email_alerts_enabled"})
     _users().update_item(
         Key={"user_id": user_id},
         UpdateExpression="SET email_alerts_enabled = :v",
@@ -232,6 +230,8 @@ def lambda_handler(event: dict[str, Any], context: Any) -> dict:
     method = (event.get("httpMethod") or "").upper()
     path_params = event.get("pathParameters") or {}
     claims = ((event.get("requestContext") or {}).get("authorizer") or {}).get("claims") or {}
+
+    logger.info(json.dumps({"resource": resource, "method": method}))
 
     if resource == "/geofences":
         if method == "GET":
