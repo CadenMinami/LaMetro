@@ -1,6 +1,12 @@
 [tool.pytest.ini_options]
 # importlib mode lets multiple test files share the same basename
 # (e.g., test_handler.py in each lambda dir) without conflicting.
+# IMPORTANT: the tests/ dirs must NOT contain __init__.py. A tests/__init__.py
+# forces every test_handler.py to the same package-qualified module name
+# (`tests.test_handler`), which makes them shadow each other — only one
+# lambda's tests would actually run in the combined `pytest lambdas/` invocation.
+# Keeping tests/ as plain (non-package) dirs lets importlib assign each file a
+# unique path-based module name.
 addopts = "--import-mode=importlib"
 testpaths = ["lambdas"]
 norecursedirs = [".venv*", ".build", "node_modules", "cdk.out"]
