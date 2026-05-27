@@ -196,6 +196,8 @@ def geofence_breaches(
         if not gf.get("enabled", False):
             continue
         threshold = _to_int(gf.get("threshold_seconds"))
+        # Strictly greater than the threshold = breach ("over your N min alert").
+        # Equality does not fire, matching the notification copy.
         if threshold is None or avg_delay <= threshold:
             continue
         last = _to_int(gf.get("last_alerted_epoch")) or 0
@@ -206,12 +208,24 @@ def geofence_breaches(
 
 
 def build_notification_item(
-    user_id: str, route_id: str, avg_delay: int, threshold: int, now: datetime
+    user_id: str,
+    route_id: str,
+    avg_delay: int,
+    threshold: int,
+    now: datetime,
+    geofence_id: str,
 ) -> dict[str, Any]:
     minutes = round(avg_delay / 60)
+    # `now` is fixed for the whole aggregation cycle, so suffix the sort key
+    # with geofence_id to keep it unique when one user has several geofences
+    # firing in the same cycle (otherwise the later put_item overwrites the
+    # earlier). The leading ISO timestamp preserves chronological sort order.
+    created_at = (
+        f"{now.astimezone(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.%fZ')}#{geofence_id}"
+    )
     return {
         "user_id": user_id,
-        "created_at": now.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+        "created_at": created_at,
         "route_id": route_id,
         "delay_seconds": avg_delay,
         "threshold_seconds": threshold,
@@ -237,16 +251,28 @@ def evaluate_geofences(
         avg_delay = agg.get("avg_delay_seconds")
         if avg_delay is None:
             continue
-        resp = geofences_table.query(
-            IndexName=GEOFENCES_ROUTE_GSI,
-            KeyConditionExpression=Key("route_id").eq(route_id),
-        )
-        breaches = geofence_breaches(resp.get("Items", []), int(avg_delay), now_epoch)
+        # Drain all GSI pages — a popular route could have more geofence rows
+        # than fit in a single 1 MB query page.
+        items: list[dict[str, Any]] = []
+        last_key = None
+        while True:
+            kwargs: dict[str, Any] = {
+                "IndexName": GEOFENCES_ROUTE_GSI,
+                "KeyConditionExpression": Key("route_id").eq(route_id),
+            }
+            if last_key:
+                kwargs["ExclusiveStartKey"] = last_key
+            resp = geofences_table.query(**kwargs)
+            items.extend(resp.get("Items", []))
+            last_key = resp.get("LastEvaluatedKey")
+            if not last_key:
+                break
+        breaches = geofence_breaches(items, int(avg_delay), now_epoch)
         for gf in breaches:
             threshold = _to_int(gf.get("threshold_seconds")) or 0
             notifications_table.put_item(
                 Item=build_notification_item(
-                    gf["user_id"], route_id, int(avg_delay), threshold, now
+                    gf["user_id"], route_id, int(avg_delay), threshold, now, gf["geofence_id"]
                 )
             )
             geofences_table.update_item(

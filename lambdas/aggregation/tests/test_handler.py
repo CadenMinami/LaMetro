@@ -157,7 +157,7 @@ def test_lambda_handler_end_to_end(monkeypatch):
     }
 
     def fake_get_table(name: str):
-        return {"fake-hot": fake_hot, "fake-agg": fake_agg}[name]
+        return {"fake-hot": fake_hot, "fake-agg": fake_agg}.get(name, MagicMock())
 
     monkeypatch.setattr(handler, "get_table", fake_get_table)
 
@@ -199,7 +199,7 @@ def test_geofence_breaches_cooldown_elapsed():
 def test_build_notification_item():
     item = handler.build_notification_item(
         user_id="u1", route_id="720", avg_delay=372, threshold=300,
-        now=datetime(2026, 5, 26, 12, 0, 0, tzinfo=timezone.utc),
+        now=datetime(2026, 5, 26, 12, 0, 0, tzinfo=timezone.utc), geofence_id="g1",
     )
     assert item["user_id"] == "u1"
     assert item["route_id"] == "720"
@@ -207,6 +207,49 @@ def test_build_notification_item():
     assert item["threshold_seconds"] == 300
     assert item["read"] is False
     assert item["created_at"].startswith("2026-05-26T12:00:00")
+    assert item["created_at"].endswith("#g1")  # unique sort key suffix
     assert "720" in item["message"]
     created_epoch = datetime(2026, 5, 26, 12, 0, 0, tzinfo=timezone.utc).timestamp()
     assert item["ttl_epoch"] > int(created_epoch)
+
+
+def test_evaluate_geofences_paginates_and_writes_unique_notifications():
+    # One route, geofences split across two GSI pages, both breaching. The
+    # pagination loop must read both, and the two notifications must get
+    # distinct sort keys even though `now` is identical.
+    now = datetime(2026, 5, 26, 12, 0, 0, tzinfo=timezone.utc)
+    gtable = MagicMock()
+    gtable.query.side_effect = [
+        {"Items": [
+            {"user_id": "u1", "geofence_id": "g1", "route_id": "720",
+             "threshold_seconds": Decimal("300"), "enabled": True,
+             "last_alerted_epoch": Decimal("0")},
+        ], "LastEvaluatedKey": {"route_id": "720", "user_id": "u1"}},
+        {"Items": [
+            {"user_id": "u2", "geofence_id": "g2", "route_id": "720",
+             "threshold_seconds": Decimal("300"), "enabled": True,
+             "last_alerted_epoch": Decimal("0")},
+        ]},
+    ]
+    ntable = MagicMock()
+    aggregates = {"720": {"avg_delay_seconds": 360, "vehicle_count": 3}}
+
+    fired = handler.evaluate_geofences(gtable, ntable, aggregates, now)
+
+    assert fired == 2
+    assert gtable.query.call_count == 2           # both pages read
+    assert ntable.put_item.call_count == 2
+    assert gtable.update_item.call_count == 2
+    sks = {c.kwargs["Item"]["created_at"] for c in ntable.put_item.call_args_list}
+    assert len(sks) == 2                           # unique sort keys
+
+
+def test_evaluate_geofences_skips_routes_without_delay():
+    now = datetime(2026, 5, 26, 12, 0, 0, tzinfo=timezone.utc)
+    gtable = MagicMock()
+    ntable = MagicMock()
+    # avg_delay None (the 4b-era / no-data case) — must not even query.
+    fired = handler.evaluate_geofences(gtable, ntable, {"33": {"avg_delay_seconds": None}}, now)
+    assert fired == 0
+    gtable.query.assert_not_called()
+    ntable.put_item.assert_not_called()
