@@ -8,16 +8,17 @@ const POLL_MS = 60_000;
 export function NotificationBell() {
   const [open, setOpen] = useState(false);
   const [items, setItems] = useState<AppNotification[]>([]);
-  const [unread, setUnread] = useState(0);
+  // Derived, not stored: a single source of truth so the badge can't drift out
+  // of sync with the list it's counting.
+  const unread = items.filter((n) => !n.read).length;
 
   useEffect(() => {
     let active = true;
     async function poll() {
       try {
-        const { notifications, unread_count } = await listNotifications();
+        const { notifications } = await listNotifications();
         if (!active) return;
         setItems(notifications);
-        setUnread(unread_count);
       } catch {
         // Silent: bell is best-effort. Auth/network errors just leave it empty.
       }
@@ -30,11 +31,13 @@ export function NotificationBell() {
     };
   }, []);
 
-  async function onOpen() {
-    setOpen((v) => !v);
+  async function onToggle() {
+    const opening = !open;
+    setOpen(opening);
+    // Only mark-read when opening the dropdown, not when closing it.
+    if (!opening) return;
     const unreadIds = items.filter((n) => !n.read).map((n) => n.id);
     if (unreadIds.length) {
-      setUnread(0);
       setItems((prev) => prev.map((n) => ({ ...n, read: true })));
       await Promise.allSettled(unreadIds.map((id) => markNotificationRead(id)));
     }
@@ -43,7 +46,7 @@ export function NotificationBell() {
   return (
     <div className="relative">
       <button
-        onClick={onOpen}
+        onClick={onToggle}
         className="relative rounded-full bg-zinc-900/80 p-2 text-zinc-200 ring-1 ring-zinc-700 hover:bg-zinc-800"
         aria-label="Notifications"
       >

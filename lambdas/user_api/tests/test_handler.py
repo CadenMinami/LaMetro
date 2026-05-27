@@ -6,6 +6,8 @@ import json
 from decimal import Decimal
 from unittest.mock import MagicMock
 
+from botocore.exceptions import ClientError
+
 from lambdas.user_api import handler
 
 
@@ -121,6 +123,22 @@ def test_mark_notification_read(monkeypatch):
     assert resp["statusCode"] == 200
     kwargs = table.update_item.call_args.kwargs
     assert kwargs["Key"] == {"user_id": "user-1", "created_at": "2026-05-26T12:00:00.000001Z"}
+    # Must guard against the upsert that would otherwise create a malformed row.
+    assert "attribute_exists" in kwargs["ConditionExpression"]
+
+
+def test_mark_notification_read_missing_row_404(monkeypatch):
+    # PATCHing a stale/expired id must 404, not silently create a phantom row.
+    table = MagicMock()
+    table.update_item.side_effect = ClientError(
+        {"Error": {"Code": "ConditionalCheckFailedException"}}, "UpdateItem"
+    )
+    monkeypatch.setattr(handler, "_notifications", lambda: table)
+    resp = handler.lambda_handler(
+        _event("/notifications/{notificationId}", "PATCH",
+               path_params={"notificationId": "does-not-exist"}), MagicMock()
+    )
+    assert resp["statusCode"] == 404
 
 
 def test_get_me(monkeypatch):
@@ -178,3 +196,17 @@ def test_get_me_falls_back_when_absent(monkeypatch):
     assert body["email"] == "r@x.com"
     assert body["email_alerts_enabled"] is False
     assert body["home_routes"] == []
+
+
+def test_get_me_backfills_partial_row(monkeypatch):
+    # A row that exists but is missing fields (older put_me wrote only the
+    # email toggle) must still come back satisfying the full Me contract.
+    table = MagicMock()
+    table.get_item.return_value = {"Item": {"user_id": "user-1", "email_alerts_enabled": True}}
+    monkeypatch.setattr(handler, "_users", lambda: table)
+    resp = handler.lambda_handler(_event("/me", "GET"), MagicMock())
+    assert resp["statusCode"] == 200
+    body = json.loads(resp["body"])
+    assert body["email_alerts_enabled"] is True   # stored value preserved
+    assert body["email"] == "r@x.com"              # backfilled from claim
+    assert body["home_routes"] == []               # backfilled default

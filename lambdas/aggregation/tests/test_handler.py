@@ -253,3 +253,14 @@ def test_evaluate_geofences_skips_routes_without_delay():
     assert fired == 0
     gtable.query.assert_not_called()
     ntable.put_item.assert_not_called()
+
+
+def test_evaluate_geofences_skips_routes_below_min_delay():
+    # A route delayed at/below the smallest possible threshold (60s) can't trip
+    # any geofence — don't waste a GSI query on it.
+    now = datetime(2026, 5, 26, 12, 0, 0, tzinfo=timezone.utc)
+    gtable = MagicMock()
+    ntable = MagicMock()
+    fired = handler.evaluate_geofences(gtable, ntable, {"33": {"avg_delay_seconds": 60}}, now)
+    assert fired == 0
+    gtable.query.assert_not_called()
