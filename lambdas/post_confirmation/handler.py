@@ -61,5 +61,10 @@ def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
         else:
             # Never fail the trigger — log and move on so the user can sign in.
             logger.exception("failed to seed user row for %s", user_id)
+    except Exception:
+        # Never fail the trigger on an unexpected error (e.g. a network blip /
+        # BotoCoreError) — that would block the user from signing in. Seeding
+        # the users row is best-effort; user_api.get_me falls back to defaults.
+        logger.exception("unexpected error seeding user row for %s", user_id)
 
     return event
