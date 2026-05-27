@@ -66,3 +66,17 @@ def test_swallows_unexpected_client_error(monkeypatch):
 
     event = _event()
     assert handler.lambda_handler(event, MagicMock()) is event
+
+
+def test_swallows_unexpected_non_client_error(monkeypatch):
+    # A transient network error (BotoCoreError, NOT a ClientError) must also be
+    # swallowed — a DDB blip must never block the user from signing in.
+    from botocore.exceptions import EndpointConnectionError
+
+    table = MagicMock()
+    table.put_item.side_effect = EndpointConnectionError(endpoint_url="https://dynamodb.local")
+    monkeypatch.setattr(handler, "get_table", lambda name: table)
+    monkeypatch.setattr(handler, "USERS_TABLE", "fake-users")
+
+    event = _event()
+    assert handler.lambda_handler(event, MagicMock()) is event

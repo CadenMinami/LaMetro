@@ -35,8 +35,8 @@ USERS_TABLE = os.environ.get("USERS_TABLE_NAME", "")
 GEOFENCES_TABLE = os.environ.get("GEOFENCES_TABLE_NAME", "")
 NOTIFICATIONS_TABLE = os.environ.get("NOTIFICATIONS_TABLE_NAME", "")
 
-# Allowed thresholds match the frontend dropdown (3/5/10 min). Enforce a sane
-# range server-side regardless of what the client sends.
+# Server-side sanity bounds on the alert threshold. The frontend dropdown
+# offers 3/5/10 min, but we accept any value within this range.
 MIN_THRESHOLD_SECONDS = 60
 MAX_THRESHOLD_SECONDS = 3600
 NOTIFICATIONS_LIMIT = 50
