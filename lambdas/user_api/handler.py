@@ -27,6 +27,7 @@ from typing import Any
 
 import boto3
 from boto3.dynamodb.conditions import Key
+from botocore.exceptions import ClientError
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -189,12 +190,23 @@ def list_notifications(user_id: str) -> dict:
 def mark_notification_read(user_id: str, notification_id: str) -> dict:
     if not notification_id:
         return _response(400, {"error": "missing_notification_id"})
-    _notifications().update_item(
-        Key={"user_id": user_id, "created_at": notification_id},
-        UpdateExpression="SET #r = :true",
-        ExpressionAttributeNames={"#r": "read"},
-        ExpressionAttributeValues={":true": True},
-    )
+    try:
+        _notifications().update_item(
+            Key={"user_id": user_id, "created_at": notification_id},
+            UpdateExpression="SET #r = :true",
+            ExpressionAttributeNames={"#r": "read"},
+            ExpressionAttributeValues={":true": True},
+            # Guard against upsert: DynamoDB's update_item creates the item if the
+            # key is absent, so a stale or TTL-expired notification id would
+            # otherwise spawn a malformed row (no message, no ttl_epoch → never
+            # expires) that then shows up in the user's list. Require the row to
+            # already exist and 404 otherwise.
+            ConditionExpression="attribute_exists(user_id)",
+        )
+    except ClientError as exc:
+        if exc.response["Error"]["Code"] == "ConditionalCheckFailedException":
+            return _response(404, {"error": "not_found"})
+        raise
     return _response(200, {"id": notification_id, "read": True})
 
 
@@ -202,10 +214,15 @@ def mark_notification_read(user_id: str, notification_id: str) -> dict:
 
 def get_me(user_id: str, email: str) -> dict:
     resp = _users().get_item(Key={"user_id": user_id})
-    item = resp.get("Item")
-    if not item:
-        # The PostConfirmation trigger normally seeds this; fall back gracefully.
-        item = {"user_id": user_id, "email": email, "email_alerts_enabled": False, "home_routes": []}
+    item = resp.get("Item") or {}
+    # Backfill any missing field so the response always satisfies the frontend
+    # `Me` contract. Covers both a never-seeded row (PostConfirmation failed or
+    # raced) and a partial row left by an older put_me that only wrote
+    # email_alerts_enabled. setdefault never clobbers a real stored value.
+    item["user_id"] = user_id
+    item.setdefault("email", email)
+    item.setdefault("email_alerts_enabled", False)
+    item.setdefault("home_routes", [])
     return _response(200, item)
 
 

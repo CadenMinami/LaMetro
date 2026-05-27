@@ -104,6 +104,25 @@ export class ApiStack extends cdk.Stack {
       },
     });
 
+    // A failed Cognito authorization (expired/invalid token) is rejected at the
+    // gateway *before* any Lambda runs, and those gateway responses don't
+    // inherit the CORS headers from defaultCorsPreflightOptions. Without these,
+    // the cross-origin SPA sees an opaque "CORS error" instead of a clean 401,
+    // so the frontend can't distinguish "logged out" from "network down".
+    // Attaching CORS headers to the 4XX/5XX gateway responses fixes that.
+    const corsResponseHeaders = {
+      'Access-Control-Allow-Origin': "'*'",
+      'Access-Control-Allow-Headers': "'Content-Type,Authorization'",
+    };
+    api.addGatewayResponse('Default4xx', {
+      type: apigw.ResponseType.DEFAULT_4XX,
+      responseHeaders: corsResponseHeaders,
+    });
+    api.addGatewayResponse('Default5xx', {
+      type: apigw.ResponseType.DEFAULT_5XX,
+      responseHeaders: corsResponseHeaders,
+    });
+
     const vehicles = api.root.addResource('vehicles');
     vehicles.addMethod('GET');
 

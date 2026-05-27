@@ -5,9 +5,10 @@ one row per route into `route-aggregates` keyed by the current 5-min bucket.
 Each minute updates the same bucket; the final write before the bucket closes
 becomes the canonical value once `last_updated` ages out of the window.
 
-Phase 4b only: `delay_seconds` is null on every vehicle until 4c lands the
-deviation algorithm. We still emit `vehicle_count` and a stub for the delay
-fields so downstream API + frontend can be wired up against real data.
+As of Phase 4c the enrichment Lambda computes `delay_seconds` per vehicle, so
+routes whose vehicles match against GTFS static get real avg/p95/on-time
+numbers (these feed the Phase 6 geofence alerts below). Routes whose vehicles
+lack a usable schedule match still emit `vehicle_count` with null delay fields.
 """
 
 from __future__ import annotations
@@ -40,6 +41,12 @@ GEOFENCES_ROUTE_GSI = os.environ.get("GEOFENCES_ROUTE_GSI", "route_id-index")
 NOTIFICATIONS_TABLE = os.environ.get("NOTIFICATIONS_TABLE_NAME", "")
 ALERT_COOLDOWN_SECONDS = int(os.environ.get("ALERT_COOLDOWN_SECONDS", "900"))  # 15 min
 NOTIFICATION_TTL_DAYS = int(os.environ.get("NOTIFICATION_TTL_DAYS", "7"))
+# A geofence only fires when avg delay strictly exceeds its threshold, and the
+# smallest threshold user-api accepts is 60s. So a route whose average delay is
+# at or below this floor can't trip any geofence — skip its per-route GSI query
+# entirely. Keeps the every-minute fan-out proportional to genuinely-late
+# routes, not all ~150 in service (cost discipline).
+MIN_ALERTABLE_DELAY_SECONDS = int(os.environ.get("MIN_ALERTABLE_DELAY_SECONDS", "60"))
 
 _ddb_resource = None
 
@@ -141,9 +148,9 @@ def aggregate_by_route(
             )
             agg["on_time_pct"] = round(on_time / len(delays) * 100, 1)
         else:
-            # Phase 4b: every vehicle has delay_seconds=None, so we land here
-            # for every route. Frontend can render "—" for these fields until
-            # 4c lights up real numbers.
+            # No vehicle on this route had a usable delay (off-route, trip
+            # missing from GTFS static, or schedule mismatch). Emit nulls; the
+            # frontend renders "—" for these fields.
             agg["avg_delay_seconds"] = None
             agg["p95_delay_seconds"] = None
             agg["on_time_pct"] = None
@@ -249,7 +256,7 @@ def evaluate_geofences(
     fired = 0
     for route_id, agg in aggregates.items():
         avg_delay = agg.get("avg_delay_seconds")
-        if avg_delay is None:
+        if avg_delay is None or int(avg_delay) <= MIN_ALERTABLE_DELAY_SECONDS:
             continue
         # Drain all GSI pages — a popular route could have more geofence rows
         # than fit in a single 1 MB query page.
