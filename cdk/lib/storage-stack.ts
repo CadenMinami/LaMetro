@@ -25,6 +25,9 @@ export class StorageStack extends cdk.Stack {
   public readonly hotVehiclesTable: dynamodb.Table;
   public readonly routeAggregatesTable: dynamodb.Table;
   public readonly websocketConnectionsTable: dynamodb.Table;
+  public readonly usersTable: dynamodb.Table;
+  public readonly geofencesTable: dynamodb.Table;
+  public readonly notificationsTable: dynamodb.Table;
   public readonly archiveBucket: s3.Bucket;
 
   constructor(scope: Construct, id: string, props: StorageStackProps = {}) {
@@ -78,6 +81,47 @@ export class StorageStack extends cdk.Stack {
     this.websocketConnectionsTable = new dynamodb.Table(this, 'WebSocketConnectionsTable', {
       tableName: 'la-metro-websocket-connections',
       partitionKey: { name: 'connection_id', type: dynamodb.AttributeType.STRING },
+      billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
+      timeToLiveAttribute: 'ttl_epoch',
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+    });
+
+    // Phase 6: per-user identity record. PK = Cognito `sub`. Seeded by the
+    // PostConfirmation Lambda trigger on signup; updated by the user-api
+    // Lambda when the user toggles email alerts. No TTL — this is durable
+    // account data, not hot state.
+    this.usersTable = new dynamodb.Table(this, 'UsersTable', {
+      tableName: 'la-metro-users',
+      partitionKey: { name: 'user_id', type: dynamodb.AttributeType.STRING },
+      billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+    });
+
+    // Phase 6: one row per geofence a user has defined. The Aggregation Lambda
+    // queries the route_id GSI ("who cares about route X?") each minute and
+    // updates last_alerted_epoch when it fires an alert.
+    this.geofencesTable = new dynamodb.Table(this, 'GeofencesTable', {
+      tableName: 'la-metro-geofences',
+      partitionKey: { name: 'user_id', type: dynamodb.AttributeType.STRING },
+      sortKey: { name: 'geofence_id', type: dynamodb.AttributeType.STRING },
+      billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+    });
+    this.geofencesTable.addGlobalSecondaryIndex({
+      indexName: 'route_id-index',
+      partitionKey: { name: 'route_id', type: dynamodb.AttributeType.STRING },
+      // Project everything: the Aggregation Lambda needs threshold_seconds,
+      // enabled, and last_alerted_epoch from the index read, plus the table
+      // keys (user_id, geofence_id) to write the cooldown update back.
+      projectionType: dynamodb.ProjectionType.ALL,
+    });
+
+    // Phase 6: in-app notifications. PK = user_id, SK = created_at (microsecond
+    // ISO, also the client-facing id). 7-day TTL keeps the table small.
+    this.notificationsTable = new dynamodb.Table(this, 'NotificationsTable', {
+      tableName: 'la-metro-notifications',
+      partitionKey: { name: 'user_id', type: dynamodb.AttributeType.STRING },
+      sortKey: { name: 'created_at', type: dynamodb.AttributeType.STRING },
       billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
       timeToLiveAttribute: 'ttl_epoch',
       removalPolicy: cdk.RemovalPolicy.DESTROY,
@@ -201,5 +245,8 @@ export class StorageStack extends cdk.Stack {
       value: this.websocketConnectionsTable.tableName,
     });
     new cdk.CfnOutput(this, 'ArchiveBucketName', { value: this.archiveBucket.bucketName });
+    new cdk.CfnOutput(this, 'UsersTableName', { value: this.usersTable.tableName });
+    new cdk.CfnOutput(this, 'GeofencesTableName', { value: this.geofencesTable.tableName });
+    new cdk.CfnOutput(this, 'NotificationsTableName', { value: this.notificationsTable.tableName });
   }
 }
