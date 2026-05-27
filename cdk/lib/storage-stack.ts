@@ -19,6 +19,9 @@ export interface StorageStackProps extends cdk.StackProps {
  * Why one shard: 1MB/s + 1000 records/s is more than enough for one transit
  * agency (~1700 vehicles × 1 record/min = 28 records/s). Reshard later if we
  * add a second agency.
+ *
+ * Phase 6 additions: `users`, `geofences` (+ route_id GSI), and
+ * `notifications` tables for auth + in-app alerts.
  */
 export class StorageStack extends cdk.Stack {
   public readonly vehicleStream: kinesis.Stream;
@@ -110,6 +113,7 @@ export class StorageStack extends cdk.Stack {
     this.geofencesTable.addGlobalSecondaryIndex({
       indexName: 'route_id-index',
       partitionKey: { name: 'route_id', type: dynamodb.AttributeType.STRING },
+      sortKey: { name: 'user_id', type: dynamodb.AttributeType.STRING },
       // Project everything: the Aggregation Lambda needs threshold_seconds,
       // enabled, and last_alerted_epoch from the index read, plus the table
       // keys (user_id, geofence_id) to write the cooldown update back.
@@ -244,9 +248,9 @@ export class StorageStack extends cdk.Stack {
     new cdk.CfnOutput(this, 'WebSocketConnectionsTableName', {
       value: this.websocketConnectionsTable.tableName,
     });
-    new cdk.CfnOutput(this, 'ArchiveBucketName', { value: this.archiveBucket.bucketName });
     new cdk.CfnOutput(this, 'UsersTableName', { value: this.usersTable.tableName });
     new cdk.CfnOutput(this, 'GeofencesTableName', { value: this.geofencesTable.tableName });
     new cdk.CfnOutput(this, 'NotificationsTableName', { value: this.notificationsTable.tableName });
+    new cdk.CfnOutput(this, 'ArchiveBucketName', { value: this.archiveBucket.bucketName });
   }
 }
