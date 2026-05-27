@@ -945,20 +945,54 @@ After the existing `/stops/{stopId}/arrivals` block (around line 110, before the
 
 > Note: the existing `/vehicles`, `/routes/*`, `/stops/*` methods stay public — they're added with the default handler (`queryFn`) and no `authMethodOptions`. Only the methods above carry the Cognito authorizer.
 
-- [ ] **Step 4: Build the user_api asset and type-check**
+- [ ] **Step 4: Wire AuthStack + the new ApiStack props into `cdk/bin/cdk.ts`**
+
+The new `ApiStackProps` fields are *required*, so the call site in `cdk/bin/cdk.ts` must be updated in the same task or the project won't type-check. Also construct `AuthStack` here (ApiStack needs `auth.userPool`).
+
+Add the import after the other stack imports:
+```typescript
+import { AuthStack } from '../lib/auth-stack';
+```
+
+Construct `AuthStack` after `storage` and before `processing`:
+```typescript
+const auth = new AuthStack(app, 'LaMetro-AuthStack', {
+  env,
+  usersTable: storage.usersTable,
+  description: 'Phase 6: Cognito user pool + PostConfirmation trigger.',
+});
+```
+
+Add the new deps to the existing `api` construct's props object:
+```typescript
+  userPool: auth.userPool,
+  usersTable: storage.usersTable,
+  geofencesTable: storage.geofencesTable,
+  notificationsTable: storage.notificationsTable,
+```
+
+Add `auth` to the tagging loop array (so cost-allocation tags apply):
+```typescript
+for (const stack of [storage, auth, ingestion, processing, api, frontend, websocket, billing]) {
+```
+
+> Note: ProcessingStack's new props (geofences/notifications) are added in Task 6 — do NOT add them to the `processing` call here yet, or the build breaks (the interface doesn't require them until Task 6).
+
+- [ ] **Step 5: Build the assets and verify the whole project compiles + synths**
 
 Run:
 ```bash
 scripts/build-lambda.sh user_api
-cd cdk && npx tsc --noEmit
+scripts/build-lambda.sh post_confirmation
+cd cdk && npx tsc --noEmit && npx cdk synth LaMetro-ApiStack LaMetro-AuthStack --quiet
 ```
-Expected: build succeeds; no type errors. (App wiring is Task 7.)
+Expected: both assets build; `tsc --noEmit` passes for the WHOLE project (cdk.ts now passes the required props); the two stacks synth without missing-asset errors.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 6: Commit**
 
 ```bash
-git add cdk/lib/api-stack.ts
-git commit -m "Phase 6: Cognito authorizer + authenticated routes on ApiStack"
+git add cdk/lib/api-stack.ts cdk/bin/cdk.ts
+git commit -m "Phase 6: Cognito authorizer + authenticated routes + AuthStack wiring"
 ```
 
 ---
@@ -1183,64 +1217,36 @@ After the existing `props.routeAggregatesTable.grantWriteData(aggregationFn);`, 
     props.notificationsTable.grantWriteData(aggregationFn);
 ```
 
-- [ ] **Step 8: Type-check and commit**
+- [ ] **Step 8: Pass the new tables into ProcessingStack from `cdk/bin/cdk.ts`**
 
-Run: `cd cdk && npx tsc --noEmit` → expect no errors.
+The two new `ProcessingStackProps` fields are required, so update the call site in the same task. In the existing `processing = new ProcessingStack(...)` props object in `cdk/bin/cdk.ts`, add:
+
+```typescript
+  geofencesTable: storage.geofencesTable,
+  notificationsTable: storage.notificationsTable,
+```
+
+(`AuthStack` and the `api`/tagging wiring were already added in Task 5; do not duplicate them.)
+
+- [ ] **Step 9: Type-check and commit**
+
+Run: `cd cdk && npx tsc --noEmit` → expect no errors (whole project, including the updated cdk.ts call site).
 
 ```bash
-git add lambdas/aggregation/ cdk/lib/processing-stack.ts
+git add lambdas/aggregation/ cdk/lib/processing-stack.ts cdk/bin/cdk.ts
 git commit -m "Phase 6: geofence evaluation + notifications in Aggregation Lambda"
 ```
 
 ---
 
-## Task 7: Wire AuthStack into the CDK app + update CI build list
+## Task 7: Update CI build list + full integration synth
 
 **Files:**
-- Modify: `cdk/bin/cdk.ts`
 - Modify: `.github/workflows/pr-checks.yml`
 
-- [ ] **Step 1: Construct AuthStack and pass new deps through**
+> The `cdk/bin/cdk.ts` wiring (AuthStack construction, ApiStack props, ProcessingStack props, tagging loop) was already done in Tasks 5 and 6 to keep the tree compiling. This task adds the new lambdas to CI and runs the whole-app integration synth as the final infra gate.
 
-In `cdk/bin/cdk.ts`, add the import after the others:
-
-```typescript
-import { AuthStack } from '../lib/auth-stack';
-```
-
-Construct `AuthStack` after `storage` and before `processing`:
-
-```typescript
-const auth = new AuthStack(app, 'LaMetro-AuthStack', {
-  env,
-  usersTable: storage.usersTable,
-  description: 'Phase 6: Cognito user pool + PostConfirmation trigger.',
-});
-```
-
-Add the new tables to the `processing` props:
-
-```typescript
-  geofencesTable: storage.geofencesTable,
-  notificationsTable: storage.notificationsTable,
-```
-
-Add the new deps to the `api` props:
-
-```typescript
-  userPool: auth.userPool,
-  usersTable: storage.usersTable,
-  geofencesTable: storage.geofencesTable,
-  notificationsTable: storage.notificationsTable,
-```
-
-Add `auth` to the tagging loop array:
-
-```typescript
-for (const stack of [storage, auth, ingestion, processing, api, frontend, websocket, billing]) {
-```
-
-- [ ] **Step 2: Add new lambdas to the CI build loop**
+- [ ] **Step 1: Add new lambdas to the CI build loop**
 
 In `.github/workflows/pr-checks.yml`, in the "Build Lambda assets" step, change the loop to include the two new lambdas:
 
@@ -1250,25 +1256,25 @@ In `.github/workflows/pr-checks.yml`, in the "Build Lambda assets" step, change 
           done
 ```
 
-- [ ] **Step 3: Full local build + synth**
+- [ ] **Step 2: Full local build + synth (whole app)**
 
 Run:
 ```bash
 for d in ingestion enrichment query_api aggregation websocket user_api post_confirmation; do scripts/build-lambda.sh "$d"; done
 cd cdk && npx tsc --noEmit && npx cdk synth --quiet
 ```
-Expected: synth succeeds and prints the templates (or `--quiet` suppresses output and exits 0). Confirm there are no missing-asset errors for `user_api/.build` or `post_confirmation/.build`.
+Expected: synth succeeds for the WHOLE app (all stacks, including AuthStack + the now-wired ApiStack/ProcessingStack). Confirm there are no missing-asset errors for `user_api/.build` or `post_confirmation/.build`.
 
-- [ ] **Step 4: Run the whole Python suite**
+- [ ] **Step 3: Run the whole Python suite**
 
 Run: `pytest lambdas/`
 Expected: all PASS.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 4: Commit**
 
 ```bash
-git add cdk/bin/cdk.ts .github/workflows/pr-checks.yml
-git commit -m "Phase 6: wire AuthStack into CDK app + CI build list"
+git add .github/workflows/pr-checks.yml
+git commit -m "Phase 6: add user_api + post_confirmation to CI build list"
 ```
 
 ---
