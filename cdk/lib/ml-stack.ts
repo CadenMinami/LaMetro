@@ -8,6 +8,7 @@ import * as targets from 'aws-cdk-lib/aws-events-targets';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import * as dynamodb from 'aws-cdk-lib/aws-dynamodb';
 import * as s3 from 'aws-cdk-lib/aws-s3';
+import * as glue from 'aws-cdk-lib/aws-glue';
 
 export interface MLStackProps extends cdk.StackProps {
   routeAggregatesTable: dynamodb.ITable;
@@ -80,6 +81,81 @@ export class MLStack extends cdk.Stack {
       targets: [new targets.LambdaFunction(this.featureSnapshotFn)],
       description: 'Triggers feature-snapshot every 5 min.',
     });
+
+    // ---- Glue catalog over processed-features/ ----
+    // Partition projection avoids needing a crawler: Athena infers the
+    // partition values from a date range we declare here. The catalog only
+    // stores the table definition; we never pay crawler runtime cost.
+    const glueDb = new glue.CfnDatabase(this, 'GlueDatabase', {
+      catalogId: this.account,
+      databaseInput: {
+        name: 'la_metro',
+        description: 'LA Metro reliability platform — Athena/Glue catalog.',
+      },
+    });
+
+    const glueTable = new glue.CfnTable(this, 'RouteWindowFeaturesTable', {
+      catalogId: this.account,
+      databaseName: 'la_metro',
+      tableInput: {
+        name: 'route_window_features',
+        description:
+          'Per-(route, window) snapshots written by the feature-snapshot Lambda.',
+        tableType: 'EXTERNAL_TABLE',
+        parameters: {
+          classification: 'json',
+          // Partition projection — Athena auto-generates partition values.
+          'projection.enabled': 'true',
+          'projection.year.type': 'integer',
+          'projection.year.range': '2026,2030',
+          'projection.month.type': 'integer',
+          'projection.month.range': '1,12',
+          'projection.month.digits': '2',
+          'projection.day.type': 'integer',
+          'projection.day.range': '1,31',
+          'projection.day.digits': '2',
+          'projection.hour.type': 'integer',
+          'projection.hour.range': '0,23',
+          'projection.hour.digits': '2',
+          'storage.location.template':
+            `s3://${props.archiveBucket.bucketName}/processed-features/` +
+            'year=${year}/month=${month}/day=${day}/hour=${hour}/',
+        },
+        partitionKeys: [
+          { name: 'year', type: 'int' },
+          { name: 'month', type: 'int' },
+          { name: 'day', type: 'int' },
+          { name: 'hour', type: 'int' },
+        ],
+        storageDescriptor: {
+          location: `s3://${props.archiveBucket.bucketName}/processed-features/`,
+          inputFormat: 'org.apache.hadoop.mapred.TextInputFormat',
+          outputFormat:
+            'org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat',
+          serdeInfo: {
+            serializationLibrary: 'org.openx.data.jsonserde.JsonSerDe',
+            parameters: { 'ignore.malformed.json': 'true' },
+          },
+          columns: [
+            { name: 'route_id', type: 'string' },
+            { name: 'window_start_iso', type: 'string' },
+            { name: 'avg_delay_seconds', type: 'int' },
+            { name: 'p95_delay_seconds', type: 'int' },
+            { name: 'on_time_pct', type: 'double' },
+            { name: 'vehicle_count', type: 'int' },
+            { name: 'temp_c', type: 'double' },
+            { name: 'precip_mm', type: 'double' },
+            { name: 'weather_observed_at', type: 'string' },
+            { name: 'ingested_at', type: 'string' },
+          ],
+          compressed: true,
+        },
+      },
+    });
+    glueTable.addDependency(glueDb);
+
+    new cdk.CfnOutput(this, 'GlueDatabaseName', { value: 'la_metro' });
+    new cdk.CfnOutput(this, 'GlueTableName', { value: 'route_window_features' });
 
     new cdk.CfnOutput(this, 'FeatureSnapshotFnName', {
       value: this.featureSnapshotFn.functionName,
