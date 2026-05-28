@@ -112,11 +112,11 @@ def build_feature_record(
 
 import gzip  # noqa: E402  (stdlib, safe to import after module-level helpers)
 import os
-import urllib.parse
 import urllib.request
 from uuid import uuid4
 
 import boto3
+from boto3.dynamodb.conditions import Key
 
 ROUTE_AGGREGATES_TABLE = os.environ.get("ROUTE_AGGREGATES_TABLE_NAME", "")
 ROUTE_AGGREGATES_WINDOW_GSI = os.environ.get(
@@ -200,8 +200,7 @@ def query_window_rows(window_iso: str) -> list[dict[str, Any]]:
     while True:
         kwargs: dict[str, Any] = {
             "IndexName": ROUTE_AGGREGATES_WINDOW_GSI,
-            "KeyConditionExpression": "window_start_iso = :w",
-            "ExpressionAttributeValues": {":w": window_iso},
+            "KeyConditionExpression": Key("window_start_iso").eq(window_iso),
         }
         if last_key:
             kwargs["ExclusiveStartKey"] = last_key

@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 from decimal import Decimal
+from unittest.mock import MagicMock
 
 from lambdas.feature_snapshot import handler
 
@@ -103,10 +105,6 @@ def test_build_feature_record_handles_4b_era_null_delays():
     rec = handler.build_feature_record(agg_row, None, "2026-05-27T12:05:30Z")
     assert rec["avg_delay_seconds"] is None
     assert rec["vehicle_count"] == 4
-
-
-import json
-from unittest.mock import MagicMock
 
 
 def _agg_rows():
