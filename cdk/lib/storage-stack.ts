@@ -31,6 +31,7 @@ export class StorageStack extends cdk.Stack {
   public readonly usersTable: dynamodb.Table;
   public readonly geofencesTable: dynamodb.Table;
   public readonly notificationsTable: dynamodb.Table;
+  public readonly weatherCacheTable: dynamodb.Table;
   public readonly archiveBucket: s3.Bucket;
 
   constructor(scope: Construct, id: string, props: StorageStackProps = {}) {
@@ -74,6 +75,17 @@ export class StorageStack extends cdk.Stack {
       billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
       timeToLiveAttribute: 'ttl_epoch',
       removalPolicy: cdk.RemovalPolicy.DESTROY,
+    });
+
+    // Phase 7a: lets the feature-snapshot Lambda fetch "all routes' aggregate
+    // rows for window X" in one query instead of a full-table scan. Projection
+    // ALL because the snapshot needs avg_delay_seconds + p95 + on_time_pct +
+    // vehicle_count alongside the keys.
+    this.routeAggregatesTable.addGlobalSecondaryIndex({
+      indexName: 'window_start_iso-index',
+      partitionKey: { name: 'window_start_iso', type: dynamodb.AttributeType.STRING },
+      sortKey: { name: 'route_id', type: dynamodb.AttributeType.STRING },
+      projectionType: dynamodb.ProjectionType.ALL,
     });
 
     // Phase 5a: each open WebSocket has one row here. Connection Lambdas
@@ -126,6 +138,19 @@ export class StorageStack extends cdk.Stack {
       tableName: 'la-metro-notifications',
       partitionKey: { name: 'user_id', type: dynamodb.AttributeType.STRING },
       sortKey: { name: 'created_at', type: dynamodb.AttributeType.STRING },
+      billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
+      timeToLiveAttribute: 'ttl_epoch',
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+    });
+
+    // Phase 7a: tiny single-row cache holding the most recent LA weather
+    // observation. Written by feature-snapshot each 5-min cycle; read by
+    // precompute-predictions (7c) so a second Lambda doesn't also call
+    // Open-Meteo. 10-min TTL guarantees stale rows can't linger if snapshot
+    // stops running.
+    this.weatherCacheTable = new dynamodb.Table(this, 'WeatherCacheTable', {
+      tableName: 'la-metro-weather-cache',
+      partitionKey: { name: 'id', type: dynamodb.AttributeType.STRING },
       billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
       timeToLiveAttribute: 'ttl_epoch',
       removalPolicy: cdk.RemovalPolicy.DESTROY,
@@ -251,6 +276,7 @@ export class StorageStack extends cdk.Stack {
     new cdk.CfnOutput(this, 'UsersTableName', { value: this.usersTable.tableName });
     new cdk.CfnOutput(this, 'GeofencesTableName', { value: this.geofencesTable.tableName });
     new cdk.CfnOutput(this, 'NotificationsTableName', { value: this.notificationsTable.tableName });
+    new cdk.CfnOutput(this, 'WeatherCacheTableName', { value: this.weatherCacheTable.tableName });
     new cdk.CfnOutput(this, 'ArchiveBucketName', { value: this.archiveBucket.bucketName });
   }
 }
