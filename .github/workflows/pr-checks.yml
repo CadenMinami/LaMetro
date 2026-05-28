@@ -27,7 +27,7 @@ jobs:
           # import it, so install it explicitly for CI.
           pip install pytest boto3
       - name: Run pytest
-        run: pytest lambdas/
+        run: pytest
 
   cdk:
     name: CDK synth
