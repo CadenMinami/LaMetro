@@ -5,8 +5,6 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from decimal import Decimal
 
-import pytest
-
 from lambdas.feature_snapshot import handler
 
 
@@ -28,6 +26,13 @@ def test_second_to_last_closed_window_iso_crosses_hour():
     # 13:01:00 → open window 13:00; last closed 12:55; second to last 12:50.
     now = datetime(2026, 5, 27, 13, 1, 0, tzinfo=timezone.utc)
     assert handler.second_to_last_closed_window_iso(now) == "2026-05-27T12:50:00Z"
+
+
+def test_second_to_last_closed_window_iso_crosses_midnight():
+    # 00:04 UTC → open window 00:00, last closed 23:55 (prev day),
+    # second to last 23:50 (prev day).
+    now = datetime(2026, 5, 27, 0, 4, 0, tzinfo=timezone.utc)
+    assert handler.second_to_last_closed_window_iso(now) == "2026-05-26T23:50:00Z"
 
 
 def test_parse_open_meteo_response_happy_path():
@@ -69,6 +74,7 @@ def test_build_feature_record_with_weather():
     assert rec["temp_c"] == 22.4
     assert rec["precip_mm"] == 0.0
     assert rec["ingested_at"] == "2026-05-27T12:05:30Z"
+    assert rec["weather_observed_at"] == "2026-05-27T12:00"
 
 
 def test_build_feature_record_without_weather_omits_those_fields():
