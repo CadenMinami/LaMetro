@@ -22,6 +22,10 @@ export interface StorageStackProps extends cdk.StackProps {
  *
  * Phase 6 additions: `users`, `geofences` (+ route_id GSI), and
  * `notifications` tables for auth + in-app alerts.
+ *
+ * Phase 7a additions: `weather-cache` (single-row, 10-min TTL) and a
+ * `window_start_iso-index` GSI on `route-aggregates` so the feature-snapshot
+ * Lambda can fetch one window's per-route rows in a single query.
  */
 export class StorageStack extends cdk.Stack {
   public readonly vehicleStream: kinesis.Stream;
