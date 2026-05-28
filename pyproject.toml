@@ -8,7 +8,7 @@
 # Keeping tests/ as plain (non-package) dirs lets importlib assign each file a
 # unique path-based module name.
 addopts = "--import-mode=importlib"
-testpaths = ["lambdas"]
+testpaths = ["lambdas", "ml"]
 norecursedirs = [".venv*", ".build", "node_modules", "cdk.out"]
 # Put the repo root on sys.path so tests can do `from lambdas.<x> import handler`.
 # importlib mode doesn't auto-add rootdir, so we add it explicitly.
