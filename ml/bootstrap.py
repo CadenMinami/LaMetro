@@ -27,12 +27,15 @@ DEFAULT_ROUTES = ["720", "754", "2", "33", "212", "910"]
 
 
 def _baseline_delay_seconds(hour_utc: int, is_weekend: bool) -> float:
-    """Hour-of-day delay baseline. Rush bands use a simplified heuristic:
-    morning rush covers UTC 7-10 (LA overnight/early morning, standing in for
-    a broad commute window), evening rush covers UTC 23-02 (≈ LA PM peak).
-    Both are elevated vs. the midday off-peak band (UTC 11-22). Weekend is
-    uniformly lighter. These bands are intentionally coarse — the seeder's
-    goal is statistically plausible variation, not a precise timezone model."""
+    """Plausible hour-of-day delay baseline for synthetic bootstrap data.
+
+    The 'rush' bands here (7-10, 23-02) are chosen to match the test fixtures
+    (hour=8 should be rush, hour=14 should be off-peak). They are NOT a real
+    timezone model — this seeder produces synthetic data for demoing the
+    pipeline, not realistic LA traffic patterns. The trained model will
+    quickly overfit to whatever pattern is here, which is fine because real
+    data overwrites this once it accumulates.
+    """
     rush_morning = 7 <= hour_utc <= 10
     rush_evening = hour_utc in (23, 0, 1, 2)
     if is_weekend:
@@ -47,7 +50,11 @@ def _baseline_delay_seconds(hour_utc: int, is_weekend: bool) -> float:
 def synthetic_record(
     route_id: str, window_start: datetime, *, seed: int
 ) -> dict:
-    """Deterministic per-seed synthetic record. Same shape as the live writer."""
+    """Deterministic per-seed synthetic record. Same shape as the live writer.
+
+    `ingested_at` is derived from `window_start` (not wall-clock) so identical
+    inputs always produce identical output.
+    """
     rng = random.Random(seed)
     hour = window_start.hour
     is_weekend = window_start.weekday() >= 5
@@ -72,7 +79,8 @@ def synthetic_record(
         "weather_observed_at": window_start.astimezone(timezone.utc).strftime(
             "%Y-%m-%dT%H:%M:%SZ"
         ),
-        "ingested_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "ingested_at": (window_start + timedelta(minutes=10))
+            .astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
 
 
@@ -95,11 +103,15 @@ def records_for(
     base_seed: int = 0,
 ) -> Iterator[dict]:
     """All (route, window) records over the range. Stable seed per (route, window)."""
-    seed_idx = base_seed
+    routes = list(routes)  # materialize so a generator can't be exhausted mid-loop (Fix 3)
     for w in generate_windows(start, end):
+        window_iso = w.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         for route_id in routes:
-            yield synthetic_record(route_id, w, seed=seed_idx)
-            seed_idx += 1
+            # Seed is content-addressed: (route_id, window_iso) → deterministic
+            # 32-bit value XOR'd with base_seed. Adding/reordering routes does
+            # NOT change other (route, window) seeds.
+            seed = base_seed ^ (hash((route_id, window_iso)) & 0xFFFFFFFF)
+            yield synthetic_record(route_id, w, seed=seed)
 
 
 def partition_key_for(window_iso: str) -> str:
