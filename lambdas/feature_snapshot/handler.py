@@ -31,6 +31,8 @@ def second_to_last_closed_window_iso(now: datetime) -> str:
     """Return the ISO of the window that started ~10 min before `now`,
     floored to a 5-minute boundary. That's the window we snapshot.
     """
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
     # Floor `now` to the current 5-min boundary (the *open* window's start).
     floored = now.replace(
         minute=(now.minute // WINDOW_MINUTES) * WINDOW_MINUTES,
@@ -52,7 +54,7 @@ def parse_open_meteo_response(body: bytes) -> dict | None:
     current = doc.get("current") if isinstance(doc, dict) else None
     if not isinstance(current, dict):
         return None
-    if "temperature_2m" not in current or "precipitation" not in current:
+    if current.get("temperature_2m") is None or current.get("precipitation") is None:
         return None
     return {
         "temp_c": current["temperature_2m"],
