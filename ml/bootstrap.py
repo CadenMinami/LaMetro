@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import gzip
+import hashlib
 import json
 import random
 from datetime import datetime, timedelta, timezone
@@ -109,8 +110,12 @@ def records_for(
         for route_id in routes:
             # Seed is content-addressed: (route_id, window_iso) → deterministic
             # 32-bit value XOR'd with base_seed. Adding/reordering routes does
-            # NOT change other (route, window) seeds.
-            seed = base_seed ^ (hash((route_id, window_iso)) & 0xFFFFFFFF)
+            # NOT change other (route, window) seeds, and re-running the
+            # seeder produces identical data (sha256 is cross-process stable).
+            # Cross-process-stable hash (Python's built-in hash() is randomized
+            # per PEP 456). Same (route, window) → same seed in every run.
+            digest = hashlib.sha256(f"{route_id}|{window_iso}".encode()).digest()
+            seed = base_seed ^ int.from_bytes(digest[:4], "big")
             yield synthetic_record(route_id, w, seed=seed)
 
 

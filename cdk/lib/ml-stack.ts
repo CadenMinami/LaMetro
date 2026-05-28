@@ -107,7 +107,7 @@ export class MLStack extends cdk.Stack {
           // Partition projection — Athena auto-generates partition values.
           'projection.enabled': 'true',
           'projection.year.type': 'integer',
-          'projection.year.range': '2026,2030',
+          'projection.year.range': '2026,2035',
           'projection.month.type': 'integer',
           'projection.month.range': '1,12',
           'projection.month.digits': '2',
