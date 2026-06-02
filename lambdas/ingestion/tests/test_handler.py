@@ -99,6 +99,61 @@ def test_lambda_handler_errors_when_stream_name_missing():
     assert "VEHICLE_STREAM_NAME" in result["error"]
 
 
+def test_lambda_handler_skips_fetch_when_no_active_viewers():
+    """Scale-to-zero gate: with the connections table empty, ingestion must
+    short-circuit before fetching the feed or writing to Kinesis."""
+    fake_ddb = MagicMock()
+    fake_ddb.scan.return_value = {"Count": 0}
+    fake_fetch = MagicMock()
+
+    with patch.object(handler, "CONNECTIONS_TABLE_NAME", "conns"), \
+         patch.object(handler, "get_dynamodb_client", return_value=fake_ddb), \
+         patch.object(handler, "fetch_feed", fake_fetch):
+        result = handler.lambda_handler({}, None)
+
+    assert result["ok"] is True
+    assert result["skipped"] is True
+    assert result["vehicle_count"] == 0
+    fake_fetch.assert_not_called()
+
+
+def test_lambda_handler_runs_when_viewers_connected():
+    """With at least one connection row, ingestion proceeds as normal."""
+    payload = _build_feed_with_vehicles(2)
+    fake_ddb = MagicMock()
+    fake_ddb.scan.return_value = {"Count": 1}
+    fake_kinesis = MagicMock()
+    fake_kinesis.put_records.return_value = {"FailedRecordCount": 0}
+
+    with patch.object(handler, "CONNECTIONS_TABLE_NAME", "conns"), \
+         patch.object(handler, "get_dynamodb_client", return_value=fake_ddb), \
+         patch.object(handler, "fetch_feed", return_value=payload), \
+         patch.object(handler, "get_api_key", return_value="test-key"), \
+         patch.object(handler, "get_kinesis_client", return_value=fake_kinesis), \
+         patch.object(handler, "STREAM_NAME", "test-stream"):
+        result = handler.lambda_handler({}, None)
+
+    assert result["ok"] is True
+    assert result.get("skipped") is not True
+    assert result["vehicle_count"] == 2
+    fake_kinesis.put_records.assert_called_once()
+
+
+def test_has_active_viewers_fails_open_when_table_unset():
+    """No table configured → run anyway (don't silently go dark on misconfig)."""
+    with patch.object(handler, "CONNECTIONS_TABLE_NAME", ""):
+        assert handler.has_active_viewers() is True
+
+
+def test_has_active_viewers_fails_open_on_scan_error():
+    """A transient DynamoDB error must not kill ingestion — fail open."""
+    fake_ddb = MagicMock()
+    fake_ddb.scan.side_effect = RuntimeError("ddb down")
+    with patch.object(handler, "CONNECTIONS_TABLE_NAME", "conns"), \
+         patch.object(handler, "get_dynamodb_client", return_value=fake_ddb):
+        assert handler.has_active_viewers() is True
+
+
 def test_fetch_feed_sends_authorization_header_when_key_provided():
     captured: dict[str, object] = {}
 

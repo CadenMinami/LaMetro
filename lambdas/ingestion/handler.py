@@ -29,11 +29,17 @@ LOCAL_API_KEY = os.environ.get("LA_METRO_API_KEY", "")
 STREAM_NAME = os.environ.get("VEHICLE_STREAM_NAME", "")
 HTTP_TIMEOUT_SECONDS = float(os.environ.get("HTTP_TIMEOUT_SECONDS", "8"))
 
+# Scale-to-zero gate: the WebSocket connections table is our "is anyone
+# watching?" signal. Empty table → skip the whole cycle (no fetch, no Kinesis
+# put, so enrichment never fires and DynamoDB writes drop to zero while idle).
+CONNECTIONS_TABLE_NAME = os.environ.get("CONNECTIONS_TABLE_NAME", "")
+
 # Kinesis PutRecords hard limit: 500 records per call.
 KINESIS_BATCH_SIZE = 500
 
 _secrets_client = None
 _kinesis_client = None
+_dynamodb_client = None
 _cached_api_key: str | None = None
 
 
@@ -57,6 +63,36 @@ def get_kinesis_client():
     if _kinesis_client is None:
         _kinesis_client = boto3.client("kinesis")
     return _kinesis_client
+
+
+def get_dynamodb_client():
+    global _dynamodb_client
+    if _dynamodb_client is None:
+        _dynamodb_client = boto3.client("dynamodb")
+    return _dynamodb_client
+
+
+def has_active_viewers() -> bool:
+    """True if at least one client is connected (a row in the connections table).
+
+    Fails OPEN: if no table is configured or the lookup errors, we return True
+    so a misconfig or a transient DynamoDB blip keeps the pipeline running
+    rather than silently going dark. The cost of failing open is "runs while
+    idle"; the cost of failing closed is "live map breaks" — the former is the
+    safer mistake.
+    """
+    if not CONNECTIONS_TABLE_NAME:
+        return True
+    try:
+        # Select=COUNT + Limit=1 reads at most one item: we only need to know
+        # whether *any* connection exists, not how many.
+        resp = get_dynamodb_client().scan(
+            TableName=CONNECTIONS_TABLE_NAME, Select="COUNT", Limit=1
+        )
+        return resp.get("Count", 0) > 0
+    except Exception:
+        logger.warning("presence_check_failed; failing open", exc_info=True)
+        return True
 
 
 def fetch_feed(url: str, timeout: float, api_key: str = "") -> bytes:
@@ -128,6 +164,14 @@ def put_records_batched(stream_name: str, events: list[dict[str, Any]]) -> dict[
 
 def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     start = time.monotonic()
+
+    # Scale-to-zero gate. Check before fetching so an idle pipeline costs
+    # nothing beyond this sub-100ms DynamoDB lookup (which is free-tier sized).
+    if not has_active_viewers():
+        log_record = {"ok": True, "skipped": True, "reason": "no_active_viewers", "vehicle_count": 0}
+        logger.info(json.dumps(log_record))
+        return log_record
+
     try:
         payload = fetch_feed(FEED_URL, HTTP_TIMEOUT_SECONDS, get_api_key())
         feed = parse_feed(payload)
