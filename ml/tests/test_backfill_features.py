@@ -185,3 +185,9 @@ def test_process_day_writes_features_end_to_end(monkeypatch):
     written = json.loads(gzip.decompress(s3.put_object.call_args.kwargs["Body"]).decode())
     assert written["route_id"] == "70" and written["vehicle_count"] == 2
     assert written["temp_c"] == 20.0
+
+
+def test_daterange_inclusive():
+    assert bf.daterange("2026-05-07", "2026-05-09") == [
+        "2026-05-07", "2026-05-08", "2026-05-09",
+    ]
