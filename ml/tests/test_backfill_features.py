@@ -154,3 +154,34 @@ def test_write_window_records_puts_one_gzip_object():
     assert kw["Key"] == key
     assert kw["ContentEncoding"] == "gzip"
     assert json.loads(gzip.decompress(kw["Body"]).decode())["route_id"] == "70"
+
+
+def test_process_day_writes_features_end_to_end(monkeypatch):
+    # One raw object, two positions for route "70" trip "t1" in window 19:00.
+    # Base epoch 1778180400 = 2026-05-07T19:00:00Z (matches weather_idx hour key).
+    blob = (
+        b'{"vehicle_id":"v1","route_id":"70","trip_id":"t1","lat":34.05,'
+        b'"lon":-118.24,"vehicle_timestamp":1778180400}'
+        b'{"vehicle_id":"v2","route_id":"70","trip_id":"t1","lat":34.06,'
+        b'"lon":-118.25,"vehicle_timestamp":1778180410}'
+        b'{"vehicle_id":"v3","route_id":"","trip_id":"","lat":0.0,'   # deadhead, skipped
+        b'"lon":0.0,"vehicle_timestamp":1778180410}'
+    )
+    s3 = MagicMock()
+    # list_day_keys + read use these two calls:
+    monkeypatch.setattr(bf, "list_day_keys", lambda s3c, b, d: ["raw-events/k.gz"])
+    monkeypatch.setattr(bf, "read_gz", lambda s3c, b, k: gzip.compress(blob))
+    monkeypatch.setattr(bf, "delay_for_record", lambda rec, gtfs: 60)
+
+    gtfs = _FakeGTFS(shape="S", schedule=(("s",),))
+    weather_idx = {"2026-05-07T19:00": {"temp_c": 20.0, "precip_mm": 0.0,
+                                        "observed_at": "2026-05-07T19:00"}}
+
+    windows, records = bf.process_day(
+        s3, "bkt", "2026-05-07", gtfs, weather_idx, ingested_at_iso="2026-06-02T00:00:00Z",
+    )
+    assert windows == 1
+    assert records == 1                       # one route in one window
+    written = json.loads(gzip.decompress(s3.put_object.call_args.kwargs["Body"]).decode())
+    assert written["route_id"] == "70" and written["vehicle_count"] == 2
+    assert written["temp_c"] == 20.0
