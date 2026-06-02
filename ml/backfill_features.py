@@ -5,11 +5,12 @@ One-time local script. See docs/superpowers/specs/2026-06-02-feature-backfill-de
 
 from __future__ import annotations
 
+import argparse
 import gzip
 import json
 import urllib.request
 from collections import defaultdict
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Iterable, Iterator
 from zoneinfo import ZoneInfo
 
@@ -234,3 +235,42 @@ def process_day(
             windows_written += 1
             records_written += len(rows)
     return windows_written, records_written
+
+
+def daterange(start_date: str, end_date: str) -> list[str]:
+    """Inclusive list of YYYY-MM-DD strings from start to end."""
+    d0 = date.fromisoformat(start_date)
+    d1 = date.fromisoformat(end_date)
+    out, cur = [], d0
+    while cur <= d1:
+        out.append(cur.isoformat())
+        cur += timedelta(days=1)
+    return out
+
+
+def main(argv: list[str] | None = None) -> int:
+    import boto3
+
+    p = argparse.ArgumentParser(description="Backfill route_window_features from raw events.")
+    p.add_argument("--bucket", required=True, help="Archive bucket name.")
+    p.add_argument("--start", required=True, help="Start date YYYY-MM-DD.")
+    p.add_argument("--end", required=True, help="End date YYYY-MM-DD (inclusive).")
+    args = p.parse_args(argv)
+
+    s3 = boto3.client("s3")
+    gtfs = gtfs_static.load_from_s3(args.bucket, shapes=True)   # current pointer covers the window
+    weather_idx = fetch_archive_weather(args.start, args.end)
+    ingested_at_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    total_w = total_r = 0
+    for day in daterange(args.start, args.end):
+        w, r = process_day(s3, args.bucket, day, gtfs, weather_idx, ingested_at_iso)
+        total_w += w
+        total_r += r
+        print(f"{day}: {w} windows, {r} records")
+    print(f"DONE: {total_w} windows, {total_r} feature records")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
