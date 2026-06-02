@@ -50,3 +50,38 @@ def test_dedupe_keeps_latest_position_per_vehicle_window():
     # keyed by (vehicle, window_iso) → latest record
     assert out[("v1", "2026-05-07T19:00:00Z")]["lat"] == 2.0
     assert out[("v1", "2026-05-07T19:05:00Z")]["lat"] == 9.0
+
+
+class _FakeGTFS:
+    """Minimal stand-in for GTFSStatic with the two methods we use."""
+    def __init__(self, shape, schedule):
+        self._shape, self._schedule = shape, schedule
+    def shape_for_trip(self, trip_id):
+        return self._shape
+    def schedule_for_trip(self, trip_id):
+        return self._schedule
+
+
+def test_delay_for_record_delegates_to_deviation(monkeypatch):
+    captured = {}
+
+    def fake_compute(shape, schedule, lat, lon, secs):
+        captured.update(shape=shape, schedule=schedule, lat=lat, lon=lon, secs=secs)
+        return 42
+
+    monkeypatch.setattr(bf.deviation, "compute_delay_seconds", fake_compute)
+    gtfs = _FakeGTFS(shape="SHAPE", schedule=(("s",),))
+    # 1778180400 = 2026-05-07T19:00:00Z = noon LA (PDT).
+    rec = {"trip_id": "t", "lat": 34.05, "lon": -118.24,
+           "vehicle_timestamp": 1778180400}
+
+    assert bf.delay_for_record(rec, gtfs) == 42
+    assert captured["shape"] == "SHAPE"
+    assert captured["lat"] == 34.05
+    assert captured["secs"] == 12 * 3600  # noon LA
+
+
+def test_delay_for_record_none_when_trip_unknown(monkeypatch):
+    gtfs = _FakeGTFS(shape=None, schedule=None)
+    rec = {"trip_id": "t", "lat": 1.0, "lon": 1.0, "vehicle_timestamp": 1778180400}
+    assert bf.delay_for_record(rec, gtfs) is None

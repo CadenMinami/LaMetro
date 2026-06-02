@@ -10,6 +10,8 @@ from datetime import datetime, timezone
 from typing import Any, Iterable, Iterator
 from zoneinfo import ZoneInfo
 
+from lambdas.shared import deviation, gtfs_static
+
 LA_TZ = ZoneInfo("America/Los_Angeles")
 WINDOW_MINUTES = 5
 
@@ -70,3 +72,17 @@ def dedupe_latest(records: "Iterable[dict[str, Any]]") -> dict[tuple[str, str], 
         if cur is None or ts > int(cur["vehicle_timestamp"]):
             best[key] = r
     return best
+
+
+def delay_for_record(rec: dict[str, Any], gtfs: "gtfs_static.GTFSStatic") -> int | None:
+    """Schedule deviation (sec) for one position, or None if not computable."""
+    trip_id = rec["trip_id"]
+    shape = gtfs.shape_for_trip(trip_id)
+    schedule = gtfs.schedule_for_trip(trip_id)
+    if shape is None or not schedule:
+        return None
+    return deviation.compute_delay_seconds(
+        shape, schedule,
+        float(rec["lat"]), float(rec["lon"]),
+        seconds_into_service_day(rec["vehicle_timestamp"]),
+    )
