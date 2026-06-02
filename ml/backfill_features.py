@@ -6,6 +6,7 @@ One-time local script. See docs/superpowers/specs/2026-06-02-feature-backfill-de
 from __future__ import annotations
 
 import json
+import urllib.request
 from datetime import datetime, timezone
 from typing import Any, Iterable, Iterator
 from zoneinfo import ZoneInfo
@@ -111,3 +112,42 @@ def records_for_window(
         }
         out.append(fs.build_feature_record(agg_row, weather, ingested_at_iso))
     return out
+
+
+ARCHIVE_URL = (
+    "https://archive-api.open-meteo.com/v1/archive"
+    "?latitude=34.05&longitude=-118.24"
+    "&hourly=temperature_2m,precipitation&timezone=UTC"
+    "&start_date={start}&end_date={end}"
+)
+
+
+def parse_archive_weather(body: bytes) -> dict[str, dict[str, Any]]:
+    """Index Open-Meteo Archive hourly arrays by their 'YYYY-MM-DDTHH:MM' key."""
+    doc = json.loads(body)
+    hourly = doc.get("hourly") or {}
+    times = hourly.get("time") or []
+    temps = hourly.get("temperature_2m") or []
+    precs = hourly.get("precipitation") or []
+    out: dict[str, dict[str, Any]] = {}
+    for t, temp, prec in zip(times, temps, precs):
+        if temp is None or prec is None:
+            continue
+        out[t] = {"temp_c": float(temp), "precip_mm": float(prec), "observed_at": t}
+    return out
+
+
+def weather_for_window(window_iso: str, idx: dict[str, dict[str, Any]]) -> dict | None:
+    """Look up the archive hour ('YYYY-MM-DDTHH:00') covering this window."""
+    hour_key = window_iso[:13] + ":00"   # '2026-05-07T19:05:00Z' -> '2026-05-07T19:00'
+    return idx.get(hour_key)
+
+
+def fetch_archive_weather(start_date: str, end_date: str) -> dict[str, dict[str, Any]]:
+    """Fetch the whole date-range's hourly weather in one call. Returns {} on failure."""
+    url = ARCHIVE_URL.format(start=start_date, end=end_date)
+    try:
+        with urllib.request.urlopen(url, timeout=15) as resp:  # noqa: S310 fixed URL
+            return parse_archive_weather(resp.read())
+    except Exception:
+        return {}

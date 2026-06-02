@@ -107,3 +107,24 @@ def test_records_for_window_builds_feature_rows():
     assert row["vehicle_count"] == 2
     assert row["avg_delay_seconds"] == 90
     assert row["temp_c"] == 20.0
+
+
+def test_parse_archive_weather_indexes_by_hour():
+    body = (
+        b'{"hourly": {'
+        b'"time": ["2026-05-07T19:00", "2026-05-07T20:00"], '
+        b'"temperature_2m": [20.5, 21.0], '
+        b'"precipitation": [0.0, 0.3]}}'
+    )
+    idx = bf.parse_archive_weather(body)
+    assert idx["2026-05-07T19:00"] == {"temp_c": 20.5, "precip_mm": 0.0,
+                                       "observed_at": "2026-05-07T19:00"}
+    assert idx["2026-05-07T20:00"]["precip_mm"] == 0.3
+
+
+def test_weather_for_window_uses_the_window_hour():
+    idx = {"2026-05-07T19:00": {"temp_c": 20.5, "precip_mm": 0.0,
+                                "observed_at": "2026-05-07T19:00"}}
+    # window 19:05 -> hour bucket 19:00
+    assert bf.weather_for_window("2026-05-07T19:05:00Z", idx)["temp_c"] == 20.5
+    assert bf.weather_for_window("2026-05-07T21:00:00Z", idx) is None
