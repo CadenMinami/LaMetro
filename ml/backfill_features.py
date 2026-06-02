@@ -10,6 +10,8 @@ from datetime import datetime, timezone
 from typing import Any, Iterable, Iterator
 from zoneinfo import ZoneInfo
 
+from lambdas.aggregation import handler as agg
+from lambdas.feature_snapshot import handler as fs
 from lambdas.shared import deviation, gtfs_static
 
 LA_TZ = ZoneInfo("America/Los_Angeles")
@@ -86,3 +88,26 @@ def delay_for_record(rec: dict[str, Any], gtfs: "gtfs_static.GTFSStatic") -> int
         float(rec["lat"]), float(rec["lon"]),
         seconds_into_service_day(rec["vehicle_timestamp"]),
     )
+
+
+def records_for_window(
+    window_iso: str,
+    vehicles: list[dict[str, Any]],
+    weather: dict | None,
+    ingested_at_iso: str,
+) -> list[dict[str, Any]]:
+    """Aggregate one window's vehicles into per-route feature records, matching
+    the live feature_snapshot schema exactly."""
+    by_route = agg.aggregate_by_route(vehicles)   # {route_id: {count, avg, p95, on_time}}
+    out: list[dict[str, Any]] = []
+    for route_id, a in by_route.items():
+        agg_row = {
+            "route_id": route_id,
+            "window_start_iso": window_iso,
+            "avg_delay_seconds": a["avg_delay_seconds"],
+            "p95_delay_seconds": a["p95_delay_seconds"],
+            "on_time_pct": a["on_time_pct"],
+            "vehicle_count": a["vehicle_count"],
+        }
+        out.append(fs.build_feature_record(agg_row, weather, ingested_at_iso))
+    return out

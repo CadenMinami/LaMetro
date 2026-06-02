@@ -85,3 +85,25 @@ def test_delay_for_record_none_when_trip_unknown(monkeypatch):
     gtfs = _FakeGTFS(shape=None, schedule=None)
     rec = {"trip_id": "t", "lat": 1.0, "lon": 1.0, "vehicle_timestamp": 1778180400}
     assert bf.delay_for_record(rec, gtfs) is None
+
+
+def test_records_for_window_builds_feature_rows():
+    # Two vehicles on route "70" in one window; delays already attached.
+    deduped = {
+        ("v1", "2026-05-07T19:00:00Z"): {"route_id": "70", "delay_seconds": 60},
+        ("v2", "2026-05-07T19:00:00Z"): {"route_id": "70", "delay_seconds": 120},
+    }
+    weather = {"temp_c": 20.0, "precip_mm": 0.0, "observed_at": "2026-05-07T19:00"}
+    rows = bf.records_for_window(
+        "2026-05-07T19:00:00Z",
+        [r for r in deduped.values()],
+        weather,
+        ingested_at_iso="2026-06-02T00:00:00Z",
+    )
+    assert len(rows) == 1                      # one route
+    row = rows[0]
+    assert row["route_id"] == "70"
+    assert row["window_start_iso"] == "2026-05-07T19:00:00Z"
+    assert row["vehicle_count"] == 2
+    assert row["avg_delay_seconds"] == 90
+    assert row["temp_c"] == 20.0
