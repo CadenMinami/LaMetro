@@ -8,6 +8,7 @@ from __future__ import annotations
 import gzip
 import json
 import urllib.request
+from collections import defaultdict
 from datetime import datetime, timezone
 from typing import Any, Iterable, Iterator
 from zoneinfo import ZoneInfo
@@ -177,3 +178,59 @@ def write_window_records(s3, bucket: str, window_iso: str, rows: list[dict[str, 
         ContentType="application/x-ndjson", ContentEncoding="gzip",
     )
     return key
+
+
+def list_day_keys(s3, bucket: str, date_str: str) -> list[str]:
+    """All raw-event object keys for a YYYY-MM-DD date (paginated)."""
+    y, m, d = date_str.split("-")
+    prefix = f"raw-events/year={y}/month={m}/day={d}/"
+    keys: list[str] = []
+    token = None
+    while True:
+        kw = {"Bucket": bucket, "Prefix": prefix}
+        if token:
+            kw["ContinuationToken"] = token
+        resp = s3.list_objects_v2(**kw)
+        keys.extend(o["Key"] for o in resp.get("Contents", []) if o["Key"].endswith(".gz"))
+        token = resp.get("NextContinuationToken")
+        if not token:
+            break
+    return keys
+
+
+def read_gz(s3, bucket: str, key: str) -> bytes:
+    """Raw gzip bytes of an S3 object."""
+    return s3.get_object(Bucket=bucket, Key=key)["Body"].read()
+
+
+def process_day(
+    s3, bucket: str, date_str: str, gtfs, weather_idx: dict, ingested_at_iso: str,
+) -> tuple[int, int]:
+    """Backfill one date. Returns (windows_written, records_written)."""
+    # 1. Read + parse + filter to routed positions.
+    routed: list[dict[str, Any]] = []
+    for key in list_day_keys(s3, bucket, date_str):
+        for rec in iter_json_objects(gzip.decompress(read_gz(s3, bucket, key))):
+            if is_routed(rec):
+                routed.append(rec)
+
+    # 2. Dedupe to latest per (vehicle, window).
+    deduped = dedupe_latest(routed)
+
+    # 3. Attach delay, group by window.
+    by_window: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for (vehicle_id, window_iso), rec in deduped.items():
+        delay = delay_for_record(rec, gtfs)
+        by_window[window_iso].append({"route_id": rec["route_id"], "delay_seconds": delay})
+
+    # 4. Aggregate + write one object per window.
+    windows_written = records_written = 0
+    for window_iso, vehicles in by_window.items():
+        rows = records_for_window(
+            window_iso, vehicles, weather_for_window(window_iso, weather_idx), ingested_at_iso,
+        )
+        if rows:
+            write_window_records(s3, bucket, window_iso, rows)
+            windows_written += 1
+            records_written += len(rows)
+    return windows_written, records_written
