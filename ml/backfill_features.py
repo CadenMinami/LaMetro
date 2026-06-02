@@ -5,6 +5,7 @@ One-time local script. See docs/superpowers/specs/2026-06-02-feature-backfill-de
 
 from __future__ import annotations
 
+import gzip
 import json
 import urllib.request
 from datetime import datetime, timezone
@@ -151,3 +152,28 @@ def fetch_archive_weather(start_date: str, end_date: str) -> dict[str, dict[str,
             return parse_archive_weather(resp.read())
     except Exception:
         return {}
+
+
+PROCESSED_PREFIX = "processed-features"
+
+
+def backfill_s3_key(window_iso: str) -> str:
+    """Deterministic key (no random suffix) so re-running a day overwrites
+    rather than duplicating. '-backfill' distinguishes from live feature_snapshot."""
+    dt = datetime.strptime(window_iso, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    return (
+        f"{PROCESSED_PREFIX}"
+        f"/year={dt:%Y}/month={dt:%m}/day={dt:%d}/hour={dt:%H}"
+        f"/window={window_iso}-backfill.jsonl.gz"
+    )
+
+
+def write_window_records(s3, bucket: str, window_iso: str, rows: list[dict[str, Any]]) -> str:
+    """Gzip + PUT one JSONL object for a window. Returns the key."""
+    body = "\n".join(json.dumps(r) for r in rows).encode("utf-8")
+    key = backfill_s3_key(window_iso)
+    s3.put_object(
+        Bucket=bucket, Key=key, Body=gzip.compress(body),
+        ContentType="application/x-ndjson", ContentEncoding="gzip",
+    )
+    return key
