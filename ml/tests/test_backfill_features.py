@@ -1,3 +1,7 @@
+import gzip
+import json
+from unittest.mock import MagicMock
+
 from ml import backfill_features as bf
 
 
@@ -128,3 +132,25 @@ def test_weather_for_window_uses_the_window_hour():
     # window 19:05 -> hour bucket 19:00
     assert bf.weather_for_window("2026-05-07T19:05:00Z", idx)["temp_c"] == 20.5
     assert bf.weather_for_window("2026-05-07T21:00:00Z", idx) is None
+
+
+def test_backfill_s3_key_is_deterministic():
+    k1 = bf.backfill_s3_key("2026-05-07T19:05:00Z")
+    k2 = bf.backfill_s3_key("2026-05-07T19:05:00Z")
+    assert k1 == k2  # idempotent — no random suffix
+    assert k1 == (
+        "processed-features/year=2026/month=05/day=07/hour=19/"
+        "window=2026-05-07T19:05:00Z-backfill.jsonl.gz"
+    )
+
+
+def test_write_window_records_puts_one_gzip_object():
+    s3 = MagicMock()
+    rows = [{"route_id": "70", "window_start_iso": "2026-05-07T19:05:00Z"}]
+    key = bf.write_window_records(s3, "bkt", "2026-05-07T19:05:00Z", rows)
+    s3.put_object.assert_called_once()
+    kw = s3.put_object.call_args.kwargs
+    assert kw["Bucket"] == "bkt"
+    assert kw["Key"] == key
+    assert kw["ContentEncoding"] == "gzip"
+    assert json.loads(gzip.decompress(kw["Body"]).decode())["route_id"] == "70"
