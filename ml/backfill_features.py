@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timezone
-from typing import Any, Iterator
+from typing import Any, Iterable, Iterator
 from zoneinfo import ZoneInfo
 
 LA_TZ = ZoneInfo("America/Los_Angeles")
@@ -47,3 +47,26 @@ def seconds_into_service_day(epoch: int) -> int:
     accepted edge for aggregate features.)"""
     local = datetime.fromtimestamp(int(epoch), tz=LA_TZ)
     return local.hour * 3600 + local.minute * 60 + local.second
+
+
+def window_start_iso(epoch: int) -> str:
+    """Floor a unix timestamp to its 5-min UTC window start, ISO-Z."""
+    dt = datetime.fromtimestamp(int(epoch), tz=timezone.utc)
+    floored = dt.replace(
+        minute=(dt.minute // WINDOW_MINUTES) * WINDOW_MINUTES,
+        second=0, microsecond=0,
+    )
+    return floored.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def dedupe_latest(records: "Iterable[dict[str, Any]]") -> dict[tuple[str, str], dict[str, Any]]:
+    """Keep the newest position per (vehicle_id, window). The perf move: this is
+    roughly what the live pipeline scored — one position per vehicle per window."""
+    best: dict[tuple[str, str], dict[str, Any]] = {}
+    for r in records:
+        ts = int(r["vehicle_timestamp"])
+        key = (r["vehicle_id"], window_start_iso(ts))
+        cur = best.get(key)
+        if cur is None or ts > int(cur["vehicle_timestamp"]):
+            best[key] = r
+    return best

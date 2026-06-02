@@ -30,3 +30,23 @@ def test_seconds_into_service_day_la_local():
     #  corrected here so the assertion reflects the true noon-LA fact it claims.)
     secs = bf.seconds_into_service_day(1778180400)
     assert secs == 12 * 3600  # noon local
+
+
+def test_window_start_iso_floors_to_5min_utc():
+    # 2026-05-07T19:07:42Z floors to 19:05:00Z. Base epoch 1778180400 = 19:00:00Z.
+    assert bf.window_start_iso(1778180400 + 7 * 60 + 42) == "2026-05-07T19:05:00Z"
+
+
+def test_dedupe_keeps_latest_position_per_vehicle_window():
+    recs = [
+        {"vehicle_id": "v1", "route_id": "r", "trip_id": "t", "lat": 1.0, "lon": 1.0,
+         "vehicle_timestamp": 1778180400},          # 19:00:00Z, window 19:00
+        {"vehicle_id": "v1", "route_id": "r", "trip_id": "t", "lat": 2.0, "lon": 2.0,
+         "vehicle_timestamp": 1778180430},          # 19:00:30Z, same window — newer
+        {"vehicle_id": "v1", "route_id": "r", "trip_id": "t", "lat": 9.0, "lon": 9.0,
+         "vehicle_timestamp": 1778180700},          # 19:05:00Z, next window
+    ]
+    out = bf.dedupe_latest(recs)
+    # keyed by (vehicle, window_iso) → latest record
+    assert out[("v1", "2026-05-07T19:00:00Z")]["lat"] == 2.0
+    assert out[("v1", "2026-05-07T19:05:00Z")]["lat"] == 9.0
