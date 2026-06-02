@@ -166,9 +166,30 @@ def test_lambda_handler_writes_one_s3_object_with_n_lines(monkeypatch):
     wc_table.put_item.assert_called_once()
     cache_item = wc_table.put_item.call_args.kwargs["Item"]
     assert cache_item["id"] == "la"
-    assert cache_item["temp_c"] == 22.4
-    assert cache_item["precip_mm"] == 0.0
+    # Stored as Decimal (DynamoDB rejects float); compare against Decimal since
+    # Decimal("22.4") != the float 22.4 due to binary-float imprecision.
+    assert cache_item["temp_c"] == Decimal("22.4")
+    assert cache_item["precip_mm"] == Decimal("0.0")
     assert cache_item["ttl_epoch"] > int(fixed_now.timestamp())
+
+
+def test_upsert_weather_cache_uses_decimal_not_float(monkeypatch):
+    """DynamoDB's resource API rejects Python float — weather values must be
+    Decimal. Regression: a live invoke raised 'Float types are not supported.
+    Use Decimal types instead.' because Open-Meteo returns floats."""
+    wc_table = MagicMock()
+    monkeypatch.setattr(handler, "_weather_cache", lambda: wc_table)
+    now = datetime(2026, 5, 27, 12, 2, 30, tzinfo=timezone.utc)
+
+    handler.upsert_weather_cache(
+        {"temp_c": 22.4, "precip_mm": 0.0, "observed_at": "2026-05-27T12:00"}, now
+    )
+
+    item = wc_table.put_item.call_args.kwargs["Item"]
+    assert isinstance(item["temp_c"], Decimal)
+    assert isinstance(item["precip_mm"], Decimal)
+    assert item["temp_c"] == Decimal("22.4")
+    assert item["precip_mm"] == Decimal("0.0")
 
 
 def test_lambda_handler_writes_records_without_weather_when_open_meteo_fails(monkeypatch):

@@ -112,6 +112,7 @@ def build_feature_record(
 import gzip  # noqa: E402  (stdlib, safe to import after module-level helpers)
 import os
 import urllib.request
+from decimal import Decimal
 from uuid import uuid4
 
 import boto3
@@ -212,12 +213,16 @@ def query_window_rows(window_iso: str) -> list[dict[str, Any]]:
 
 
 def upsert_weather_cache(weather: dict, now: datetime) -> None:
-    """Single-row cache used by the precompute-predictions Lambda (7c)."""
+    """Single-row cache used by the precompute-predictions Lambda (7c).
+
+    Open-Meteo returns floats, but DynamoDB's resource API only accepts Decimal
+    for numbers — convert via str() to avoid binary-float imprecision.
+    """
     _weather_cache().put_item(
         Item={
             "id": "la",
-            "temp_c": weather["temp_c"],
-            "precip_mm": weather["precip_mm"],
+            "temp_c": Decimal(str(weather["temp_c"])),
+            "precip_mm": Decimal(str(weather["precip_mm"])),
             "observed_at": weather.get("observed_at", ""),
             "cached_at": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
             "ttl_epoch": int(now.timestamp()) + WEATHER_CACHE_TTL_SECONDS,
