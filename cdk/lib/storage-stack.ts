@@ -27,6 +27,12 @@ export interface StorageStackProps extends cdk.StackProps {
  * `window_start_iso-index` GSI on `route-aggregates` so the feature-snapshot
  * Lambda can fetch one window's per-route rows in a single query.
  */
+// Fixed physical name for the WebSocket connections table. Exported so other
+// stacks (e.g. ingestion's scale-to-zero gate) can reference the table by name
+// + a constructed ARN instead of a cross-stack import — keeps stacks decoupled
+// and independently deployable.
+export const WEBSOCKET_CONNECTIONS_TABLE_NAME = 'la-metro-websocket-connections';
+
 export class StorageStack extends cdk.Stack {
   public readonly vehicleStream: kinesis.Stream;
   public readonly hotVehiclesTable: dynamodb.Table;
@@ -98,7 +104,7 @@ export class StorageStack extends cdk.Stack {
     // updates. 2h TTL guarantees stale rows can't accumulate even if the
     // disconnect handler fails to fire (e.g., abrupt client kill).
     this.websocketConnectionsTable = new dynamodb.Table(this, 'WebSocketConnectionsTable', {
-      tableName: 'la-metro-websocket-connections',
+      tableName: WEBSOCKET_CONNECTIONS_TABLE_NAME,
       partitionKey: { name: 'connection_id', type: dynamodb.AttributeType.STRING },
       billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
       timeToLiveAttribute: 'ttl_epoch',

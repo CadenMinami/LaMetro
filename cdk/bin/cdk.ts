@@ -3,7 +3,7 @@ import 'source-map-support/register';
 import * as cdk from 'aws-cdk-lib';
 import { IngestionStack } from '../lib/ingestion-stack';
 import { BillingStack } from '../lib/billing-stack';
-import { StorageStack } from '../lib/storage-stack';
+import { StorageStack, WEBSOCKET_CONNECTIONS_TABLE_NAME } from '../lib/storage-stack';
 import { ProcessingStack } from '../lib/processing-stack';
 import { ApiStack } from '../lib/api-stack';
 import { FrontendStack } from '../lib/frontend-stack';
@@ -35,6 +35,7 @@ const ingestion = new IngestionStack(app, 'LaMetro-IngestionStack', {
   swiftlySecretName: process.env.SWIFTLY_SECRET_NAME ?? 'la-metro/swiftly-api-key',
   laMetroFeedUrl: process.env.LA_METRO_FEED_URL,
   vehicleStream: storage.vehicleStream,
+  connectionsTableName: WEBSOCKET_CONNECTIONS_TABLE_NAME,
   description: 'LA Metro GTFS-RT ingestion Lambda + EventBridge schedule.',
 });
 
