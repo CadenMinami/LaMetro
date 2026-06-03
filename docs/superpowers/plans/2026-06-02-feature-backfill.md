@@ -1,6 +1,8 @@
 # Feature Backfill Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [x]`) syntax for tracking.
+
+> **STATUS: COMPLETE (2026-06-03).** Tasks 1–9 implemented + committed (see `git log`). Task 10 full-range backfill ran 2026-06-02: 7,513 `…-backfill.jsonl.gz` objects in S3, 288 windows/day × May 7–Jun 2 (partial edges on day 7 = 232, day 2 = 81), ~107 routes/window. Schema verified against feature_snapshot. All 176 tests pass.
 
 **Goal:** A one-time local script (`ml/backfill_features.py`) that turns 26 days of raw GTFS-RT positions in S3 into the same `route_window_features` table the live `feature_snapshot` Lambda produces, using real schedule-deviation delays.
 
@@ -37,7 +39,7 @@ Imports of lambda code use the same path the tests/CI use: `from lambdas.shared 
 - Create: `ml/backfill_features.py`
 - Test: `ml/tests/test_backfill_features.py`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```python
 from ml import backfill_features as bf
@@ -58,12 +60,12 @@ def test_iter_json_objects_stops_cleanly_on_malformed_tail():
     assert list(bf.iter_json_objects(raw)) == [{"a": 1}]
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `python -m pytest ml/tests/test_backfill_features.py -q`
 Expected: FAIL — `AttributeError: module 'ml.backfill_features' has no attribute 'iter_json_objects'`
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 ```python
 """Backfill route_window_features from raw GTFS-RT events in S3.
@@ -98,12 +100,12 @@ def iter_json_objects(raw: bytes) -> Iterator[dict[str, Any]]:
         i = end
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run: `python -m pytest ml/tests/test_backfill_features.py -q`
 Expected: PASS (3 passed)
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add ml/backfill_features.py ml/tests/test_backfill_features.py
@@ -118,7 +120,7 @@ git commit -m "backfill: concatenated-JSON parser for raw-event blobs"
 - Modify: `ml/backfill_features.py`
 - Test: `ml/tests/test_backfill_features.py`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```python
 def test_is_routed_requires_route_and_trip():
@@ -135,12 +137,12 @@ def test_seconds_into_service_day_la_local():
     assert secs == 12 * 3600  # noon local
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `python -m pytest ml/tests/test_backfill_features.py -q`
 Expected: FAIL — `AttributeError: ... has no attribute 'is_routed'`
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 Add near the top imports:
 
@@ -169,12 +171,12 @@ def seconds_into_service_day(epoch: int) -> int:
     return local.hour * 3600 + local.minute * 60 + local.second
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run: `python -m pytest ml/tests/test_backfill_features.py -q`
 Expected: PASS
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add ml/backfill_features.py ml/tests/test_backfill_features.py
@@ -189,7 +191,7 @@ git commit -m "backfill: routed-record filter + LA service-day seconds"
 - Modify: `ml/backfill_features.py`
 - Test: `ml/tests/test_backfill_features.py`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```python
 def test_window_start_iso_floors_to_5min_utc():
@@ -212,12 +214,12 @@ def test_dedupe_keeps_latest_position_per_vehicle_window():
     assert out[("v1", "2026-05-07T19:05:00Z")]["lat"] == 9.0
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `python -m pytest ml/tests/test_backfill_features.py -q`
 Expected: FAIL — no attribute `window_start_iso`
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 ```python
 def window_start_iso(epoch: int) -> str:
@@ -245,12 +247,12 @@ def dedupe_latest(records: "Iterable[dict[str, Any]]") -> dict[tuple[str, str], 
 
 Add `Iterable` to the typing import: `from typing import Any, Iterable, Iterator`.
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run: `python -m pytest ml/tests/test_backfill_features.py -q`
 Expected: PASS
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add ml/backfill_features.py ml/tests/test_backfill_features.py
@@ -265,7 +267,7 @@ git commit -m "backfill: 5-min window flooring + latest-per-vehicle dedupe"
 - Modify: `ml/backfill_features.py`
 - Test: `ml/tests/test_backfill_features.py`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Use a fake GTFS object exposing the two methods the function calls — avoids building a real pickle.
 
@@ -304,12 +306,12 @@ def test_delay_for_record_none_when_trip_unknown(monkeypatch):
     assert bf.delay_for_record(rec, gtfs) is None
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `python -m pytest ml/tests/test_backfill_features.py -q`
 Expected: FAIL — no attribute `delay_for_record` (and `bf.deviation` not imported yet)
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 Add import near top:
 
@@ -334,12 +336,12 @@ def delay_for_record(rec: dict[str, Any], gtfs: "gtfs_static.GTFSStatic") -> int
     )
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run: `python -m pytest ml/tests/test_backfill_features.py -q`
 Expected: PASS
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add ml/backfill_features.py ml/tests/test_backfill_features.py
@@ -354,7 +356,7 @@ git commit -m "backfill: per-position delay via shared deviation"
 - Modify: `ml/backfill_features.py`
 - Test: `ml/tests/test_backfill_features.py`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```python
 def test_records_for_window_builds_feature_rows():
@@ -379,12 +381,12 @@ def test_records_for_window_builds_feature_rows():
     assert row["temp_c"] == 20.0
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `python -m pytest ml/tests/test_backfill_features.py -q`
 Expected: FAIL — no attribute `records_for_window`
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 Add imports:
 
@@ -419,12 +421,12 @@ def records_for_window(
     return out
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run: `python -m pytest ml/tests/test_backfill_features.py -q`
 Expected: PASS
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add ml/backfill_features.py ml/tests/test_backfill_features.py
@@ -439,7 +441,7 @@ git commit -m "backfill: window aggregation -> feature records (reuse agg + feat
 - Modify: `ml/backfill_features.py`
 - Test: `ml/tests/test_backfill_features.py`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```python
 def test_parse_archive_weather_indexes_by_hour():
@@ -463,12 +465,12 @@ def test_weather_for_window_uses_the_window_hour():
     assert bf.weather_for_window("2026-05-07T21:00:00Z", idx) is None
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `python -m pytest ml/tests/test_backfill_features.py -q`
 Expected: FAIL — no attribute `parse_archive_weather`
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 ```python
 import urllib.request
@@ -512,12 +514,12 @@ def fetch_archive_weather(start_date: str, end_date: str) -> dict[str, dict[str,
         return {}
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run: `python -m pytest ml/tests/test_backfill_features.py -q`
 Expected: PASS
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add ml/backfill_features.py ml/tests/test_backfill_features.py
@@ -532,7 +534,7 @@ git commit -m "backfill: historical weather via Open-Meteo Archive + window look
 - Modify: `ml/backfill_features.py`
 - Test: `ml/tests/test_backfill_features.py`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```python
 import gzip
@@ -561,12 +563,12 @@ def test_write_window_records_puts_one_gzip_object():
     assert json.loads(gzip.decompress(kw["Body"]).decode())["route_id"] == "70"
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `python -m pytest ml/tests/test_backfill_features.py -q`
 Expected: FAIL — no attribute `backfill_s3_key`
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 ```python
 import gzip
@@ -596,12 +598,12 @@ def write_window_records(s3, bucket: str, window_iso: str, rows: list[dict[str, 
     return key
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run: `python -m pytest ml/tests/test_backfill_features.py -q`
 Expected: PASS
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add ml/backfill_features.py ml/tests/test_backfill_features.py
@@ -616,7 +618,7 @@ git commit -m "backfill: deterministic S3 key + gzip-JSONL write"
 - Modify: `ml/backfill_features.py`
 - Test: `ml/tests/test_backfill_features.py`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 `process_day` ties everything together. Inject S3 (mock), GTFS (fake), and weather index so the test stays offline. It reads raw objects for a date, returns `(windows_written, records_written)`.
 
@@ -651,12 +653,12 @@ def test_process_day_writes_features_end_to_end(monkeypatch):
     assert written["temp_c"] == 20.0
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `python -m pytest ml/tests/test_backfill_features.py -q`
 Expected: FAIL — no attribute `process_day` / `list_day_keys` / `read_gz`
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 ```python
 from collections import defaultdict
@@ -718,12 +720,12 @@ def process_day(
     return windows_written, records_written
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run: `python -m pytest ml/tests/test_backfill_features.py -q`
 Expected: PASS
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add ml/backfill_features.py ml/tests/test_backfill_features.py
@@ -738,7 +740,7 @@ git commit -m "backfill: day driver composing the full pipeline"
 - Modify: `ml/backfill_features.py`
 - Test: `ml/tests/test_backfill_features.py`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```python
 def test_daterange_inclusive():
@@ -747,12 +749,12 @@ def test_daterange_inclusive():
     ]
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `python -m pytest ml/tests/test_backfill_features.py -q`
 Expected: FAIL — no attribute `daterange`
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 ```python
 import argparse
@@ -798,12 +800,12 @@ if __name__ == "__main__":
     raise SystemExit(main())
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run: `python -m pytest ml/tests/test_backfill_features.py -q`
 Expected: PASS (all tasks' tests)
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add ml/backfill_features.py ml/tests/test_backfill_features.py
@@ -816,7 +818,7 @@ git commit -m "backfill: CLI iterating dates, single GTFS + weather load"
 
 **Files:** none (operational verification).
 
-- [ ] **Step 1: Run a single day against real S3**
+- [x] **Step 1: Run a single day against real S3**
 
 ```bash
 python -m ml.backfill_features \
@@ -825,14 +827,14 @@ python -m ml.backfill_features \
 ```
 Expected: prints `2026-05-08: <N> windows, <M> records` with N, M > 0. If M is suspiciously low (e.g. 0 routes matched), the GTFS trip-match rate is off — investigate before running the full range.
 
-- [ ] **Step 2: Confirm objects landed**
+- [x] **Step 2: Confirm objects landed**
 
 ```bash
 aws s3 ls s3://lametro-storagestack-archivebucket9decbf5d-mg7byceonzyn/processed-features/year=2026/month=05/day=08/ --recursive | head
 ```
 Expected: `…-backfill.jsonl.gz` objects across hour partitions.
 
-- [ ] **Step 3: Validate via Athena (or local fetch)**
+- [x] **Step 3: Validate via Athena (or local fetch)**
 
 Quick local check (no Athena cost): download one object and confirm schema:
 ```bash
@@ -840,7 +842,7 @@ aws s3 cp "$(aws s3 ls s3://lametro-storagestack-archivebucket9decbf5d-mg7byceon
 ```
 Expected: a JSON record with `route_id, window_start_iso, avg_delay_seconds, p95_delay_seconds, on_time_pct, vehicle_count, temp_c, precip_mm, ingested_at`.
 
-- [ ] **Step 4: Run the full range**
+- [x] **Step 4: Run the full range**
 
 ```bash
 python -m ml.backfill_features \
@@ -849,7 +851,7 @@ python -m ml.backfill_features \
 ```
 Expected: per-day lines, then `DONE:` totals. Spot-check a non-trivial total of feature records (interview "finding" depends on this being real).
 
-- [ ] **Step 5: Mark backfill task complete**
+- [x] **Step 5: Mark backfill task complete**
 
 Update task #3 to completed; note record counts + any caveats (e.g. days with low match rate) for the 7b spec.
 
