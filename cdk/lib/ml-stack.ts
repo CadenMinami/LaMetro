@@ -9,6 +9,9 @@ import * as iam from 'aws-cdk-lib/aws-iam';
 import * as dynamodb from 'aws-cdk-lib/aws-dynamodb';
 import * as s3 from 'aws-cdk-lib/aws-s3';
 import * as glue from 'aws-cdk-lib/aws-glue';
+import * as sfn from 'aws-cdk-lib/aws-stepfunctions';
+import * as scheduler from 'aws-cdk-lib/aws-scheduler';
+import * as fs from 'fs';
 
 export interface MLStackProps extends cdk.StackProps {
   routeAggregatesTable: dynamodb.ITable;
@@ -159,6 +162,381 @@ export class MLStack extends cdk.Stack {
 
     new cdk.CfnOutput(this, 'FeatureSnapshotFnName', {
       value: this.featureSnapshotFn.functionName,
+    });
+
+    // ================================================================
+    // Phase 7b — nightly training pipeline (Step Functions).
+    // ================================================================
+
+    // ---- data_sufficiency_check Lambda ----
+    // Reads the UNLOAD query's exact output-row count from Athena
+    // (GetQueryRuntimeStatistics) and gates training on it.
+    const sufficiencyName = 'la-metro-data-sufficiency-check';
+    const sufficiencyLog = new logs.LogGroup(this, 'SufficiencyFnLogs', {
+      logGroupName: `/aws/lambda/${sufficiencyName}`,
+      retention: logs.RetentionDays.ONE_WEEK,
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+    });
+    const sufficiencyFn = new lambda.Function(this, 'SufficiencyFn', {
+      functionName: sufficiencyName,
+      runtime: lambda.Runtime.PYTHON_3_12,
+      architecture: lambda.Architecture.ARM_64,
+      handler: 'handler.lambda_handler',
+      code: lambda.Code.fromAsset(
+        path.join(__dirname, '..', '..', 'lambdas', 'data_sufficiency_check', '.build'),
+      ),
+      memorySize: 256,
+      timeout: cdk.Duration.seconds(15),
+      environment: { DEFAULT_THRESHOLD_ROWS: '1000' },
+      logGroup: sufficiencyLog,
+      description: 'Phase 7b: reads UNLOAD output-row count from Athena for the gate.',
+    });
+    sufficiencyFn.addToRolePolicy(new iam.PolicyStatement({
+      actions: ['athena:GetQueryRuntimeStatistics'],
+      resources: ['*'],   // query-execution ARNs aren't known until run time
+    }));
+
+    // ---- evaluate_model Lambda ----
+    const evalName = 'la-metro-evaluate-model';
+    const evalLog = new logs.LogGroup(this, 'EvaluateFnLogs', {
+      logGroupName: `/aws/lambda/${evalName}`,
+      retention: logs.RetentionDays.ONE_WEEK,
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+    });
+    const evaluateFn = new lambda.Function(this, 'EvaluateFn', {
+      functionName: evalName,
+      runtime: lambda.Runtime.PYTHON_3_12,
+      architecture: lambda.Architecture.ARM_64,
+      handler: 'handler.lambda_handler',
+      code: lambda.Code.fromAsset(
+        path.join(__dirname, '..', '..', 'lambdas', 'evaluate_model', '.build'),
+      ),
+      memorySize: 256,
+      timeout: cdk.Duration.seconds(20),
+      environment: { VALIDATION_METRIC_NAME: 'validation:rmse' },
+      logGroup: evalLog,
+      description: 'Phase 7b: compares candidate training-job metric vs deployed model.',
+    });
+    props.archiveBucket.grantRead(evaluateFn, 'models/*');
+    evaluateFn.addToRolePolicy(new iam.PolicyStatement({
+      actions: ['sagemaker:DescribeTrainingJob'],
+      resources: ['*'],   // training job ARNs include the run-id we won't know upfront
+    }));
+
+    // ---- promote_model Lambda ----
+    const promoteName = 'la-metro-promote-model';
+    const promoteLog = new logs.LogGroup(this, 'PromoteFnLogs', {
+      logGroupName: `/aws/lambda/${promoteName}`,
+      retention: logs.RetentionDays.ONE_WEEK,
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+    });
+    const promoteFn = new lambda.Function(this, 'PromoteFn', {
+      functionName: promoteName,
+      runtime: lambda.Runtime.PYTHON_3_12,
+      architecture: lambda.Architecture.ARM_64,
+      handler: 'handler.lambda_handler',
+      code: lambda.Code.fromAsset(
+        path.join(__dirname, '..', '..', 'lambdas', 'promote_model', '.build'),
+      ),
+      memorySize: 256,
+      timeout: cdk.Duration.seconds(30),
+      environment: {},
+      logGroup: promoteLog,
+      description: 'Phase 7b: copy candidate artifact to versioned + current/, write metrics.json.',
+    });
+    // Promote reads candidates from training-jobs/ and writes to models/.
+    props.archiveBucket.grantRead(promoteFn, 'training-jobs/*');
+    props.archiveBucket.grantReadWrite(promoteFn, 'models/*');
+
+    // ---- SageMaker training-job execution role ----
+    // Reads training-sets/ (CSV input) and writes training-jobs/<job>/output/
+    // in the same archive bucket.
+    const trainingRole = new iam.Role(this, 'SageMakerTrainingRole', {
+      assumedBy: new iam.ServicePrincipal('sagemaker.amazonaws.com'),
+      description: 'Phase 7b: SageMaker training job execution role.',
+    });
+    props.archiveBucket.grantRead(trainingRole, 'training-sets/*');
+    props.archiveBucket.grantReadWrite(trainingRole, 'training-jobs/*');
+    trainingRole.addToPolicy(new iam.PolicyStatement({
+      actions: [
+        'logs:CreateLogGroup',
+        'logs:CreateLogStream',
+        'logs:PutLogEvents',
+      ],
+      resources: [`arn:aws:logs:${this.region}:${this.account}:log-group:/aws/sagemaker/TrainingJobs:*`],
+    }));
+
+    // ---- Step Functions state machine ----
+    const sfnLog = new logs.LogGroup(this, 'NightlyTrainingSfnLogs', {
+      logGroupName: '/aws/vendedlogs/states/la-metro-nightly-training',
+      retention: logs.RetentionDays.TWO_WEEKS,
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+    });
+
+    const athenaWorkgroup = 'primary';
+    const athenaResultsPrefix = `s3://${props.archiveBucket.bucketName}/athena-results/`;
+    const archiveBucketUri = `s3://${props.archiveBucket.bucketName}`;
+
+    // Build the Athena UNLOAD query string as a States.Format() intrinsic.
+    // We strip line comments and collapse whitespace so the SQL is a single
+    // line safe to embed (our SQL has no '--' or braces inside string
+    // literals, so this is lossless). ${ARCHIVE_BUCKET} is bound here at
+    // deploy time; ${RUN_ID} becomes the {} placeholder Step Functions fills
+    // with the execution name at run time.
+    const sqlRaw = fs.readFileSync(
+      path.join(__dirname, '..', '..', 'ml', 'feature_extraction.sql'),
+      'utf-8',
+    );
+    const sqlOneLine = sqlRaw
+      .split('\n')
+      .map((line: string) => line.replace(/--.*$/, ''))
+      .join(' ')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .replace('${ARCHIVE_BUCKET}', props.archiveBucket.bucketName);
+    const sqlForFormat = sqlOneLine
+      .replace(/\\/g, '\\\\')
+      .replace(/'/g, "\\'")
+      .replace('${RUN_ID}', '{}');
+    const extractQueryString = `States.Format('${sqlForFormat}', $.context.run_id)`;
+
+    const definition = {
+      Comment: 'Phase 7b nightly training pipeline.',
+      StartAt: 'GenerateRunId',
+      States: {
+        GenerateRunId: {
+          Type: 'Pass',
+          Parameters: { 'run_id.$': '$$.Execution.Name' },
+          ResultPath: '$.context',
+          Next: 'ExtractFeatures',
+        },
+        ExtractFeatures: {
+          Type: 'Task',
+          Resource: 'arn:aws:states:::athena:startQueryExecution.sync',
+          Parameters: {
+            'QueryString.$': extractQueryString,
+            WorkGroup: athenaWorkgroup,
+            ResultConfiguration: { OutputLocation: athenaResultsPrefix },
+          },
+          ResultPath: '$.athena',
+          Next: 'CheckSufficiency',
+          Catch: [{ ErrorEquals: ['States.ALL'], Next: 'FailedTerminal' }],
+        },
+        CheckSufficiency: {
+          Type: 'Task',
+          Resource: 'arn:aws:states:::lambda:invoke',
+          Parameters: {
+            FunctionName: sufficiencyFn.functionArn,
+            Payload: {
+              'query_execution_id.$': '$.athena.QueryExecution.QueryExecutionId',
+            },
+          },
+          ResultSelector: { 'result.$': '$.Payload' },
+          ResultPath: '$.sufficiency',
+          Next: 'BranchOnSufficiency',
+        },
+        BranchOnSufficiency: {
+          Type: 'Choice',
+          Choices: [{
+            Variable: '$.sufficiency.result.sufficient',
+            BooleanEquals: true,
+            Next: 'Train',
+          }],
+          Default: 'SkipTraining',
+        },
+        SkipTraining: {
+          Type: 'Succeed',
+          Comment: 'Insufficient data; gracefully skipped this run.',
+        },
+        Train: {
+          Type: 'Task',
+          Resource: 'arn:aws:states:::sagemaker:createTrainingJob.sync',
+          Parameters: {
+            'TrainingJobName.$':
+              "States.Format('la-metro-delay-{}', $.context.run_id)",
+            AlgorithmSpecification: {
+              // Built-in XGBoost 1.7-1, us-west-2 container. Region-specific —
+              // look up the URI if you deploy elsewhere.
+              TrainingImage: '746614075791.dkr.ecr.us-west-2.amazonaws.com/sagemaker-xgboost:1.7-1',
+              TrainingInputMode: 'File',
+              MetricDefinitions: [
+                { Name: 'validation:rmse', Regex: '.*\\[.*\\]#011validation-rmse:([0-9\\.]+).*' },
+                { Name: 'train:rmse',      Regex: '.*\\[.*\\]#011train-rmse:([0-9\\.]+).*' },
+              ],
+            },
+            RoleArn: trainingRole.roleArn,
+            ResourceConfig: {
+              InstanceType: 'ml.m5.large',
+              InstanceCount: 1,
+              VolumeSizeInGB: 10,
+            },
+            StoppingCondition: { MaxRuntimeInSeconds: 600 },
+            HyperParameters: {
+              objective: 'reg:squarederror',
+              num_round: '200',
+              max_depth: '6',
+              eta: '0.1',
+              subsample: '0.8',
+            },
+            InputDataConfig: [{
+              ChannelName: 'train',
+              DataSource: {
+                S3DataSource: {
+                  S3DataType: 'S3Prefix',
+                  'S3Uri.$':
+                    "States.Format('{}/training-sets/run={}/', '" +
+                    archiveBucketUri + "', $.context.run_id)",
+                  S3DataDistributionType: 'FullyReplicated',
+                },
+              },
+              ContentType: 'text/csv',
+              CompressionType: 'Gzip',
+            }],
+            OutputDataConfig: {
+              'S3OutputPath.$':
+                "States.Format('{}/training-jobs/run={}/', '" +
+                archiveBucketUri + "', $.context.run_id)",
+            },
+          },
+          ResultPath: '$.training',
+          Next: 'Evaluate',
+          Catch: [{ ErrorEquals: ['States.ALL'], Next: 'FailedTerminal' }],
+        },
+        Evaluate: {
+          Type: 'Task',
+          Resource: 'arn:aws:states:::lambda:invoke',
+          Parameters: {
+            FunctionName: evaluateFn.functionArn,
+            Payload: {
+              'training_job_name.$': '$.training.TrainingJobName',
+              'models_prefix_uri': `${archiveBucketUri}/models/`,
+            },
+          },
+          ResultSelector: { 'result.$': '$.Payload' },
+          ResultPath: '$.eval',
+          Next: 'BranchOnEval',
+        },
+        BranchOnEval: {
+          Type: 'Choice',
+          Choices: [{
+            Variable: '$.eval.result.promote',
+            BooleanEquals: true,
+            Next: 'Promote',
+          }],
+          Default: 'SkippedPromotion',
+        },
+        SkippedPromotion: {
+          Type: 'Succeed',
+          Comment: 'Candidate did not beat deployed model; not promoted.',
+        },
+        Promote: {
+          Type: 'Task',
+          Resource: 'arn:aws:states:::lambda:invoke',
+          Parameters: {
+            FunctionName: promoteFn.functionArn,
+            Payload: {
+              'candidate_model_uri.$': '$.eval.result.candidate_model_uri',
+              'models_prefix_uri': `${archiveBucketUri}/models`,
+              'candidate_metric.$': '$.eval.result.candidate_metric',
+              'metric_name.$': '$.eval.result.metric_name',
+            },
+          },
+          ResultSelector: { 'result.$': '$.Payload' },
+          ResultPath: '$.promote',
+          End: true,
+        },
+        FailedTerminal: {
+          Type: 'Fail',
+          Cause: 'A state in the nightly training pipeline failed; see CloudWatch.',
+        },
+      },
+    };
+
+    const sfnRole = new iam.Role(this, 'NightlyTrainingSfnRole', {
+      assumedBy: new iam.ServicePrincipal('states.amazonaws.com'),
+      inlinePolicies: {
+        Inline: new iam.PolicyDocument({
+          statements: [
+            new iam.PolicyStatement({
+              actions: [
+                'athena:StartQueryExecution',
+                'athena:GetQueryExecution',
+                'athena:GetQueryResults',
+                'athena:StopQueryExecution',
+              ],
+              resources: ['*'],
+            }),
+            new iam.PolicyStatement({
+              actions: ['glue:GetTable', 'glue:GetDatabase', 'glue:GetPartitions'],
+              resources: ['*'],
+            }),
+            new iam.PolicyStatement({
+              actions: ['s3:GetObject', 's3:PutObject', 's3:ListBucket', 's3:GetBucketLocation'],
+              resources: [props.archiveBucket.bucketArn, `${props.archiveBucket.bucketArn}/*`],
+            }),
+            new iam.PolicyStatement({
+              actions: ['sagemaker:CreateTrainingJob', 'sagemaker:DescribeTrainingJob', 'sagemaker:StopTrainingJob'],
+              resources: ['*'],
+            }),
+            new iam.PolicyStatement({
+              actions: ['iam:PassRole'],
+              resources: [trainingRole.roleArn],
+            }),
+            new iam.PolicyStatement({
+              actions: ['lambda:InvokeFunction'],
+              resources: [sufficiencyFn.functionArn, evaluateFn.functionArn, promoteFn.functionArn],
+            }),
+            new iam.PolicyStatement({
+              actions: ['events:PutTargets', 'events:PutRule', 'events:DescribeRule'],
+              resources: ['*'],   // required by the .sync callback pattern
+            }),
+            new iam.PolicyStatement({
+              actions: ['logs:CreateLogDelivery', 'logs:GetLogDelivery', 'logs:UpdateLogDelivery',
+                        'logs:DeleteLogDelivery', 'logs:ListLogDeliveries',
+                        'logs:PutResourcePolicy', 'logs:DescribeResourcePolicies', 'logs:DescribeLogGroups'],
+              resources: ['*'],
+            }),
+          ],
+        }),
+      },
+    });
+
+    const stateMachine = new sfn.CfnStateMachine(this, 'NightlyTrainingSfn', {
+      stateMachineName: 'la-metro-nightly-training',
+      roleArn: sfnRole.roleArn,
+      definitionString: JSON.stringify(definition),
+      loggingConfiguration: {
+        destinations: [{ cloudWatchLogsLogGroup: { logGroupArn: sfnLog.logGroupArn } }],
+        level: 'ALL',
+        includeExecutionData: true,
+      },
+    });
+
+    // ---- EventBridge Scheduler — daily at 10:00 UTC (~03:00 PT) ----
+    new scheduler.CfnSchedule(this, 'NightlyTrainingSchedule', {
+      name: 'la-metro-nightly-training',
+      scheduleExpression: 'cron(0 10 * * ? *)',
+      flexibleTimeWindow: { mode: 'OFF' },
+      target: {
+        arn: stateMachine.attrArn,
+        roleArn: new iam.Role(this, 'NightlyScheduleRole', {
+          assumedBy: new iam.ServicePrincipal('scheduler.amazonaws.com'),
+          inlinePolicies: {
+            Inline: new iam.PolicyDocument({
+              statements: [new iam.PolicyStatement({
+                actions: ['states:StartExecution'],
+                resources: [stateMachine.attrArn],
+              })],
+            }),
+          },
+        }).roleArn,
+        input: '{}',
+      },
+      description: 'Phase 7b: triggers the nightly training pipeline.',
+    });
+
+    new cdk.CfnOutput(this, 'NightlyTrainingStateMachineArn', {
+      value: stateMachine.attrArn,
     });
   }
 }
