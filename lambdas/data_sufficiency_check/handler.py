@@ -8,8 +8,12 @@ branches on the returned `sufficient` flag.
 Why GetQueryRuntimeStatistics and not the UNLOAD manifest: Athena's UNLOAD
 data manifest is a CSV that lists *output file paths only* — it carries no row
 counts — and it lives at the query-results location, not the UNLOAD target.
-Rows.OutputRows is the authoritative count, requires no extra query, and costs
-nothing.
+
+Why Rows.InputRows and not OutputRows: for an UNLOAD, the statement returns no
+rows *to the client* (it writes files), so Rows.OutputRows is ~1 — useless as a
+size signal. Rows.InputRows is the number of feature-store rows the query read
+in the 30-day window, which is exactly the "do we have enough data to train"
+signal we want. Requires no extra query and costs nothing.
 """
 
 from __future__ import annotations
@@ -35,13 +39,15 @@ def _athena():
     return _athena_client
 
 
-def output_rows_from_stats(stats: dict[str, Any]) -> int:
-    """Pull Rows.OutputRows from a GetQueryRuntimeStatistics response, or 0 if
-    the field is absent (treated as insufficient by the caller)."""
+def input_rows_from_stats(stats: dict[str, Any]) -> int:
+    """Pull Rows.InputRows from a GetQueryRuntimeStatistics response, or 0 if
+    the field is absent (treated as insufficient by the caller). InputRows is
+    the rows the UNLOAD read from the feature store — the size signal we want
+    (OutputRows is ~1 for UNLOAD; see module docstring)."""
     return int(
         stats.get("QueryRuntimeStatistics", {})
         .get("Rows", {})
-        .get("OutputRows", 0)
+        .get("InputRows", 0)
     )
 
 
@@ -52,7 +58,7 @@ def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     stats = _athena().get_query_runtime_statistics(
         QueryExecutionId=query_execution_id,
     )
-    rows = output_rows_from_stats(stats)
+    rows = input_rows_from_stats(stats)
 
     result = {
         "sufficient": rows >= threshold,
