@@ -1,18 +1,22 @@
 """Data-sufficiency check — Phase 7b.
 
-Inspects the Athena UNLOAD manifest and decides whether the training set is
-large enough to be worth training on. The Step Functions state machine
+Reads the exact output-row count of the just-run Athena UNLOAD query via
+GetQueryRuntimeStatistics (Rows.OutputRows) and decides whether the training
+set is large enough to be worth training on. The Step Functions state machine
 branches on the returned `sufficient` flag.
+
+Why GetQueryRuntimeStatistics and not the UNLOAD manifest: Athena's UNLOAD
+data manifest is a CSV that lists *output file paths only* — it carries no row
+counts — and it lives at the query-results location, not the UNLOAD target.
+Rows.OutputRows is the authoritative count, requires no extra query, and costs
+nothing.
 """
 
 from __future__ import annotations
 
-import csv
-import io
 import logging
 import os
 from typing import Any
-from urllib.parse import urlparse
 
 import boto3
 
@@ -21,56 +25,34 @@ logger.setLevel(logging.INFO)
 
 DEFAULT_THRESHOLD_ROWS = int(os.environ.get("DEFAULT_THRESHOLD_ROWS", "1000"))
 
-_s3_client = None
+_athena_client = None
 
 
-def _s3():
-    global _s3_client
-    if _s3_client is None:
-        _s3_client = boto3.client("s3")
-    return _s3_client
+def _athena():
+    global _athena_client
+    if _athena_client is None:
+        _athena_client = boto3.client("athena")
+    return _athena_client
 
 
-def row_count_from_manifest(raw: bytes) -> int | None:
-    """Sum the `rows` column from an UNLOAD manifest CSV. Returns None if the
-    manifest doesn't carry row counts (caller should use a fallback)."""
-    reader = csv.reader(io.StringIO(raw.decode("utf-8")))
-    rows = list(reader)
-    if not rows:
-        return 0
-    header = rows[0]
-    if "rows" not in header:
-        return None
-    rows_idx = header.index("rows")
-    total = 0
-    for r in rows[1:]:
-        if not r:
-            continue
-        try:
-            total += int(r[rows_idx])
-        except (IndexError, ValueError):
-            continue
-    return total
-
-
-def _split_s3(uri: str) -> tuple[str, str]:
-    p = urlparse(uri)
-    return p.netloc, p.path.lstrip("/")
+def output_rows_from_stats(stats: dict[str, Any]) -> int:
+    """Pull Rows.OutputRows from a GetQueryRuntimeStatistics response, or 0 if
+    the field is absent (treated as insufficient by the caller)."""
+    return int(
+        stats.get("QueryRuntimeStatistics", {})
+        .get("Rows", {})
+        .get("OutputRows", 0)
+    )
 
 
 def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
-    manifest_uri = event["manifest_uri"]
+    query_execution_id = event["query_execution_id"]
     threshold = int(event.get("threshold_rows", DEFAULT_THRESHOLD_ROWS))
 
-    bucket, key = _split_s3(manifest_uri)
-    raw = _s3().get_object(Bucket=bucket, Key=key)["Body"].read()
-    rows = row_count_from_manifest(raw)
-    if rows is None:
-        # Fallback path: read each listed file via head_object isn't sufficient,
-        # so for v1 we treat unknown as sufficient=False (safer than running
-        # training on possibly tiny data).
-        logger.warning("manifest_lacks_row_count; defaulting to insufficient")
-        rows = 0
+    stats = _athena().get_query_runtime_statistics(
+        QueryExecutionId=query_execution_id,
+    )
+    rows = output_rows_from_stats(stats)
 
     result = {
         "sufficient": rows >= threshold,

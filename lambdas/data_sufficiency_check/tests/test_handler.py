@@ -1,4 +1,9 @@
-"""Unit tests for the data-sufficiency check Lambda (Phase 7b)."""
+"""Unit tests for the data-sufficiency check Lambda (Phase 7b).
+
+The gate reads the *exact* output-row count of the UNLOAD query from Athena's
+GetQueryRuntimeStatistics (Rows.OutputRows) — Athena UNLOAD does not emit a
+row-annotated manifest, so this is the authoritative count.
+"""
 
 from __future__ import annotations
 
@@ -7,57 +12,48 @@ from unittest.mock import MagicMock
 from lambdas.data_sufficiency_check import handler
 
 
-def test_parse_unload_manifest_sums_rows_across_files():
-    # Athena UNLOAD writes a manifest.csv listing each output object and its
-    # row count via S3 Select / object metadata; for our purposes we just sum
-    # the rows reported in the manifest.
-    raw = b"path,rows\ns3://b/p/a.csv.gz,400\ns3://b/p/b.csv.gz,650\n"
-    assert handler.row_count_from_manifest(raw) == 1050
+def test_output_rows_from_stats_reads_nested_value():
+    stats = {"QueryRuntimeStatistics": {"Rows": {"OutputRows": 1050}}}
+    assert handler.output_rows_from_stats(stats) == 1050
 
 
-def test_parse_unload_manifest_handles_no_rows_column_with_s3_list_fallback():
-    # If the manifest doesn't carry row counts, fall back to a sentinel value
-    # so the caller knows to do a direct count.
-    raw = b"s3://b/p/a.csv.gz\ns3://b/p/b.csv.gz\n"
-    assert handler.row_count_from_manifest(raw) is None
+def test_output_rows_from_stats_defaults_to_zero_when_absent():
+    assert handler.output_rows_from_stats({}) == 0
+    assert handler.output_rows_from_stats({"QueryRuntimeStatistics": {}}) == 0
 
 
-def test_lambda_handler_promotes_when_above_threshold(monkeypatch):
-    s3 = MagicMock()
-    s3.get_object.return_value = {
-        "Body": MagicMock(read=lambda: b"path,rows\ns3://b/p/a.csv.gz,1500\n"),
+def test_lambda_handler_sufficient_when_above_threshold(monkeypatch):
+    athena = MagicMock()
+    athena.get_query_runtime_statistics.return_value = {
+        "QueryRuntimeStatistics": {"Rows": {"OutputRows": 1500}},
     }
-    monkeypatch.setattr(handler, "_s3", lambda: s3)
+    monkeypatch.setattr(handler, "_athena", lambda: athena)
 
-    event = {
-        "manifest_uri": "s3://bkt/training-sets/run=R/manifest.csv",
-        "threshold_rows": 1000,
-    }
+    event = {"query_execution_id": "qexec-1", "threshold_rows": 1000}
     result = handler.lambda_handler(event, MagicMock())
     assert result == {"sufficient": True, "row_count": 1500, "threshold_rows": 1000}
+    athena.get_query_runtime_statistics.assert_called_once_with(QueryExecutionId="qexec-1")
 
 
-def test_lambda_handler_skips_when_below_threshold(monkeypatch):
-    s3 = MagicMock()
-    s3.get_object.return_value = {
-        "Body": MagicMock(read=lambda: b"path,rows\ns3://b/p/a.csv.gz,500\n"),
+def test_lambda_handler_insufficient_when_below_threshold(monkeypatch):
+    athena = MagicMock()
+    athena.get_query_runtime_statistics.return_value = {
+        "QueryRuntimeStatistics": {"Rows": {"OutputRows": 500}},
     }
-    monkeypatch.setattr(handler, "_s3", lambda: s3)
-    event = {
-        "manifest_uri": "s3://bkt/training-sets/run=R/manifest.csv",
-        "threshold_rows": 1000,
-    }
+    monkeypatch.setattr(handler, "_athena", lambda: athena)
+    event = {"query_execution_id": "qexec-2", "threshold_rows": 1000}
     result = handler.lambda_handler(event, MagicMock())
     assert result["sufficient"] is False
     assert result["row_count"] == 500
 
 
 def test_lambda_handler_uses_default_threshold_when_event_omits_it(monkeypatch):
-    s3 = MagicMock()
-    s3.get_object.return_value = {
-        "Body": MagicMock(read=lambda: b"path,rows\ns3://b/p/a.csv.gz,2000\n"),
+    athena = MagicMock()
+    athena.get_query_runtime_statistics.return_value = {
+        "QueryRuntimeStatistics": {"Rows": {"OutputRows": 2000}},
     }
-    monkeypatch.setattr(handler, "_s3", lambda: s3)
-    event = {"manifest_uri": "s3://bkt/training-sets/run=R/manifest.csv"}
+    monkeypatch.setattr(handler, "_athena", lambda: athena)
+    event = {"query_execution_id": "qexec-3"}
     result = handler.lambda_handler(event, MagicMock())
     assert result["threshold_rows"] == handler.DEFAULT_THRESHOLD_ROWS
+    assert result["sufficient"] is True
