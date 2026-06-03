@@ -475,7 +475,12 @@ export class MLStack extends cdk.Stack {
               resources: [props.archiveBucket.bucketArn, `${props.archiveBucket.bucketArn}/*`],
             }),
             new iam.PolicyStatement({
-              actions: ['sagemaker:CreateTrainingJob', 'sagemaker:DescribeTrainingJob', 'sagemaker:StopTrainingJob'],
+              // AddTags + ListTags are required by the createTrainingJob.sync
+              // integration, which tags the job for completion tracking.
+              actions: [
+                'sagemaker:CreateTrainingJob', 'sagemaker:DescribeTrainingJob',
+                'sagemaker:StopTrainingJob', 'sagemaker:AddTags', 'sagemaker:ListTags',
+              ],
               resources: ['*'],
             }),
             new iam.PolicyStatement({
