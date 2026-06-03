@@ -36,8 +36,11 @@ UNLOAD (
       avg_delay_seconds,
       COALESCE(temp_c, 0.0)    AS temp_c,
       COALESCE(precip_mm, 0.0) AS precip_mm,
-      EXTRACT(hour FROM CAST(window_start_iso AS timestamp))      AS hour_of_day,
-      EXTRACT(day_of_week FROM CAST(window_start_iso AS timestamp)) AS day_of_week,
+      -- window_start_iso is ISO-8601 UTC ('2026-05-07T05:00:00Z'). Trino's
+      -- CAST(varchar AS timestamp) rejects the 'T'/'Z'; from_iso8601_timestamp
+      -- parses it (as timestamp with time zone, in UTC).
+      EXTRACT(hour FROM from_iso8601_timestamp(window_start_iso))      AS hour_of_day,
+      EXTRACT(day_of_week FROM from_iso8601_timestamp(window_start_iso)) AS day_of_week,
       LAG(avg_delay_seconds, 1) OVER (
         PARTITION BY route_id ORDER BY window_start_iso
       ) AS lag1_avg_delay,
