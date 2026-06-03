@@ -1,6 +1,13 @@
 # Phase 7b — Training Pipeline Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [x]`) syntax for tracking.
+
+> **STATUS: CODE COMPLETE (2026-06-03).** Tasks 1–6 implemented + committed on branch `phase-7b-training-pipeline`. 196 tests pass; `tsc --noEmit` + `cdk synth LaMetro-MLStack` clean. **Deployment & manual verification (below) deferred** — it incurs AWS cost (SageMaker training job + Athena scan) and needs explicit go-ahead.
+>
+> **Two deviations from the literal plan (both fixes the plan author flagged):**
+> 1. **Sufficiency gate** — the plan read a fictional `manifest.csv` with a `rows` column. Athena UNLOAD's data manifest lists *file paths only* (no row counts) and lives at the query-results location, so that would skip training every night. Rewrote `data_sufficiency_check` to read `GetQueryRuntimeStatistics.Rows.OutputRows` from the Athena `QueryExecutionId` (exact, no extra query). Lambda interface + tests changed accordingly.
+> 2. **`${RUN_ID}` injection** — replaced the plan's broken placeholder/JSON-surgery with a clean `States.Format()`: SQL collapsed to one line, `${ARCHIVE_BUCKET}` bound at deploy, `${RUN_ID}`→`{}` bound to `$.context.run_id` at run time. Verified the escaping round-trips in `cdk synth`.
+> 3. SQL `route_code` uses `abs(crc32(to_utf8(route_id))) % 1000` (the plan's `from_base` doesn't work on LA Metro IDs).
 
 **Goal:** Nightly Step Functions pipeline that extracts supervised training rows from the feature store via Athena, trains an XGBoost regressor on SageMaker, evaluates against a held-out time-split, and promotes the model in S3 only if MAE improves. Plus a `ml/bootstrap.py`-or-real-data sufficiency gate so cold-start days don't fail.
 
@@ -58,7 +65,7 @@ This plan was written alongside the 7a plan, before 7a's empirical behavior was 
 - Create: `ml/feature_extraction.sql`
 - Create: `ml/tests/test_feature_extraction_sql.py`
 
-- [ ] **Step 1: Write structural tests for the SQL**
+- [x] **Step 1: Write structural tests for the SQL**
 
 Create `ml/tests/test_feature_extraction_sql.py`:
 ```python
@@ -114,12 +121,12 @@ def test_filters_recent_30_days_via_partition_pruning():
     assert "year" in sql and "month" in sql and "day" in sql
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `pytest ml/tests/test_feature_extraction_sql.py -v`
 Expected: FAIL on `test_sql_file_exists` (file missing).
 
-- [ ] **Step 3: Implement the SQL**
+- [x] **Step 3: Implement the SQL**
 
 Create `ml/feature_extraction.sql`:
 ```sql
@@ -207,12 +214,12 @@ WITH (
 
 > Built-in XGBoost requires numeric features only. `from_base(route_id, 16)` works only if route_ids are hex; LA Metro uses short alphanumerics. For v1, use Athena's `abs(checksum(route_id))` instead — replace the `abs(from_base(...))` line with `cast(abs(checksum(cast(route_id as varbinary))) % 1000 as int)`. If Athena rejects checksum, fall back to a static `route_id_lookup` CTE built from `SELECT DISTINCT route_id, row_number() OVER (ORDER BY route_id)` — refine in this step before committing. The structural tests in Step 1 don't constrain this detail.
 
-- [ ] **Step 4: Run tests**
+- [x] **Step 4: Run tests**
 
 Run: `pytest ml/tests/test_feature_extraction_sql.py -v`
 Expected: PASS (6 tests).
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add ml/feature_extraction.sql ml/tests/test_feature_extraction_sql.py
@@ -228,7 +235,7 @@ git commit -m "Phase 7b: Athena feature_extraction.sql (LAG features + LEAD labe
 - Create: `lambdas/data_sufficiency_check/requirements.txt`
 - Create: `lambdas/data_sufficiency_check/tests/test_handler.py`
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Create `lambdas/data_sufficiency_check/tests/test_handler.py`:
 ```python
@@ -297,12 +304,12 @@ def test_lambda_handler_uses_default_threshold_when_event_omits_it(monkeypatch):
     assert result["threshold_rows"] == handler.DEFAULT_THRESHOLD_ROWS
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `pytest lambdas/data_sufficiency_check -v`
 Expected: FAIL — `ModuleNotFoundError`.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 Create `lambdas/data_sufficiency_check/handler.py`:
 ```python
@@ -394,12 +401,12 @@ Create `lambdas/data_sufficiency_check/requirements.txt`:
 # boto3 ships in the Lambda runtime; no third-party deps.
 ```
 
-- [ ] **Step 4: Run tests**
+- [x] **Step 4: Run tests**
 
 Run: `pytest lambdas/data_sufficiency_check -v`
 Expected: PASS (5 tests).
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add lambdas/data_sufficiency_check/
@@ -415,7 +422,7 @@ git commit -m "Phase 7b: data_sufficiency_check Lambda + tests (TDD)"
 - Create: `lambdas/evaluate_model/requirements.txt`
 - Create: `lambdas/evaluate_model/tests/test_handler.py`
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Create `lambdas/evaluate_model/tests/test_handler.py`:
 ```python
@@ -507,12 +514,12 @@ def test_lambda_handler_existing_better_model_blocks_promotion(monkeypatch):
     assert out["deployed_metric"] == 90.0
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `pytest lambdas/evaluate_model -v`
 Expected: FAIL — `ModuleNotFoundError`.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 Create `lambdas/evaluate_model/handler.py`:
 ```python
@@ -631,12 +638,12 @@ Create `lambdas/evaluate_model/requirements.txt`:
 # boto3 ships in the Lambda runtime; no third-party deps.
 ```
 
-- [ ] **Step 4: Run tests**
+- [x] **Step 4: Run tests**
 
 Run: `pytest lambdas/evaluate_model -v`
 Expected: PASS (7 tests).
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add lambdas/evaluate_model/
@@ -652,7 +659,7 @@ git commit -m "Phase 7b: evaluate_model Lambda — compare candidate vs deployed
 - Create: `lambdas/promote_model/requirements.txt`
 - Create: `lambdas/promote_model/tests/test_handler.py`
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Create `lambdas/promote_model/tests/test_handler.py`:
 ```python
@@ -720,12 +727,12 @@ def test_lambda_handler_copies_and_writes_metrics(monkeypatch):
     }
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `pytest lambdas/promote_model -v`
 Expected: FAIL — `ModuleNotFoundError`.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 Create `lambdas/promote_model/handler.py`:
 ```python
@@ -825,12 +832,12 @@ Create `lambdas/promote_model/requirements.txt`:
 # boto3 ships in the Lambda runtime; no third-party deps.
 ```
 
-- [ ] **Step 4: Run tests**
+- [x] **Step 4: Run tests**
 
 Run: `pytest lambdas/promote_model -v`
 Expected: PASS (2 tests).
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add lambdas/promote_model/
@@ -844,7 +851,7 @@ git commit -m "Phase 7b: promote_model Lambda — copy artifact + update metrics
 **Files:**
 - Modify: `cdk/lib/ml-stack.ts`
 
-- [ ] **Step 1: Add imports**
+- [x] **Step 1: Add imports**
 
 At the top of `cdk/lib/ml-stack.ts`, add:
 ```typescript
@@ -853,7 +860,7 @@ import * as tasks from 'aws-cdk-lib/aws-stepfunctions-tasks';
 import * as scheduler from 'aws-cdk-lib/aws-scheduler';
 ```
 
-- [ ] **Step 2: Add the three new Lambda functions in the constructor (same pattern as feature-snapshot)**
+- [x] **Step 2: Add the three new Lambda functions in the constructor (same pattern as feature-snapshot)**
 
 After the Glue table block in the `MLStack` constructor, add (one block per Lambda; full code for each — DO NOT factor out a helper, follow the established explicit-per-Lambda pattern in this repo's stacks):
 
@@ -934,7 +941,7 @@ After the Glue table block in the `MLStack` constructor, add (one block per Lamb
     props.archiveBucket.grantReadWrite(promoteFn, 'models/*');
 ```
 
-- [ ] **Step 3: Add the SageMaker training role**
+- [x] **Step 3: Add the SageMaker training role**
 
 After the three Lambdas, before the state machine, add:
 ```typescript
@@ -957,7 +964,7 @@ After the three Lambdas, before the state machine, add:
     }));
 ```
 
-- [ ] **Step 4: Add the Step Functions state machine**
+- [x] **Step 4: Add the Step Functions state machine**
 
 After the training role, add the state machine using L1-ish JSON definition through `sfn.DefinitionBody.fromString()` (cleaner than chaining many L2 constructs for service integrations):
 
@@ -1224,7 +1231,7 @@ After the training role, add the state machine using L1-ish JSON definition thro
 
 > The `${RUN_ID}` placeholder dance is awkward — the cleaner production move is to drop the placeholder out of the SQL entirely and write UNLOAD output to a fixed path that includes Athena's own `QueryExecutionId` (which the state machine reads from `$.athena.QueryExecution.QueryExecutionId`). Keeping it simple here for v1.
 
-- [ ] **Step 5: Add EventBridge daily schedule**
+- [x] **Step 5: Add EventBridge daily schedule**
 
 After the state machine, add:
 ```typescript
@@ -1256,7 +1263,7 @@ After the state machine, add:
     });
 ```
 
-- [ ] **Step 6: Build all assets, type-check, full synth**
+- [x] **Step 6: Build all assets, type-check, full synth**
 
 Run:
 ```bash
@@ -1268,7 +1275,7 @@ cd cdk && npx tsc --noEmit && npx cdk synth LaMetro-MLStack --quiet
 ```
 Expected: build succeeds; type-check clean; MLStack synths.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add cdk/lib/ml-stack.ts
@@ -1282,7 +1289,7 @@ git commit -m "Phase 7b: Step Functions state machine + 3 Lambdas + daily schedu
 **Files:**
 - Modify: `.github/workflows/pr-checks.yml`
 
-- [ ] **Step 1: Extend the loop**
+- [x] **Step 1: Extend the loop**
 
 In `.github/workflows/pr-checks.yml`, in the cdk job's "Build Lambda assets" step, change the loop to include the three new lambdas:
 ```yaml
@@ -1291,12 +1298,12 @@ In `.github/workflows/pr-checks.yml`, in the cdk job's "Build Lambda assets" ste
           done
 ```
 
-- [ ] **Step 2: Full Python suite**
+- [x] **Step 2: Full Python suite**
 
 Run: `pytest -q`
 Expected: previous 149 + (5 + 7 + 2 + 6 SQL) = **169 passed**.
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add .github/workflows/pr-checks.yml
