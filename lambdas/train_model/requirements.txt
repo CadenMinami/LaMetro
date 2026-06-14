@@ -1,0 +1,5 @@
+# Pinned to the SageMaker XGBoost 1.7-1 inference container 7c serves with,
+# so a booster pickled here unpickles there. numpy<2 because xgboost 1.7
+# predates numpy 2.0's C-API changes.
+xgboost==1.7.6
+numpy<2
