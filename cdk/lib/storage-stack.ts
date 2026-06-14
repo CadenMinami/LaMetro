@@ -42,6 +42,7 @@ export class StorageStack extends cdk.Stack {
   public readonly geofencesTable: dynamodb.Table;
   public readonly notificationsTable: dynamodb.Table;
   public readonly weatherCacheTable: dynamodb.Table;
+  public readonly routePredictionsTable: dynamodb.Table;
   public readonly archiveBucket: s3.Bucket;
 
   constructor(scope: Construct, id: string, props: StorageStackProps = {}) {
@@ -166,6 +167,17 @@ export class StorageStack extends cdk.Stack {
       removalPolicy: cdk.RemovalPolicy.DESTROY,
     });
 
+    // Phase 7c: one row per route, overwritten every 5 min by the
+    // precompute-predictions Lambda. The query API reads from here so user
+    // requests never pay a SageMaker endpoint cold start.
+    this.routePredictionsTable = new dynamodb.Table(this, 'RoutePredictionsTable', {
+      tableName: 'la-metro-route-predictions',
+      partitionKey: { name: 'route_id', type: dynamodb.AttributeType.STRING },
+      billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
+      timeToLiveAttribute: 'ttl_epoch',  // 15-min TTL — stale rows can't linger
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+    });
+
     this.archiveBucket = new s3.Bucket(this, 'ArchiveBucket', {
       bucketName: props.archiveBucketName,
       // RETAIN: the archive is the historical record. Don't let `cdk destroy`
@@ -287,6 +299,9 @@ export class StorageStack extends cdk.Stack {
     new cdk.CfnOutput(this, 'GeofencesTableName', { value: this.geofencesTable.tableName });
     new cdk.CfnOutput(this, 'NotificationsTableName', { value: this.notificationsTable.tableName });
     new cdk.CfnOutput(this, 'WeatherCacheTableName', { value: this.weatherCacheTable.tableName });
+    new cdk.CfnOutput(this, 'RoutePredictionsTableName', {
+      value: this.routePredictionsTable.tableName,
+    });
     new cdk.CfnOutput(this, 'ArchiveBucketName', { value: this.archiveBucket.bucketName });
   }
 }
