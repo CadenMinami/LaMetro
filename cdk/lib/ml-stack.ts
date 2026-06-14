@@ -12,6 +12,7 @@ import * as glue from 'aws-cdk-lib/aws-glue';
 import * as sfn from 'aws-cdk-lib/aws-stepfunctions';
 import * as scheduler from 'aws-cdk-lib/aws-scheduler';
 import * as fs from 'fs';
+import { Platform } from 'aws-cdk-lib/aws-ecr-assets';
 
 export interface MLStackProps extends cdk.StackProps {
   routeAggregatesTable: dynamodb.ITable;
@@ -31,6 +32,13 @@ export class MLStack extends cdk.Stack {
 
   constructor(scope: Construct, id: string, props: MLStackProps) {
     super(scope, id, props);
+
+    // Flip-back switch: false (default) uses the container Lambda trainer;
+    // true uses the managed SageMaker training job (needs training quota > 0).
+    // Deploy with: cdk deploy -c useSagemakerTraining=true
+    const useSagemakerTraining =
+      this.node.tryGetContext('useSagemakerTraining') === true ||
+      this.node.tryGetContext('useSagemakerTraining') === 'true';
 
     // ---- feature-snapshot Lambda (5-min schedule) ----
     const functionName = 'la-metro-feature-snapshot';
@@ -266,6 +274,35 @@ export class MLStack extends cdk.Stack {
       resources: [`arn:aws:logs:${this.region}:${this.account}:log-group:/aws/sagemaker/TrainingJobs:*`],
     }));
 
+    // ---- train_model container Lambda (XGBoost trainer) ----
+    // Container image because xgboost+numpy exceed the zip layer limit.
+    // x86_64 so CI builds natively and the artifact matches the x86 SageMaker
+    // XGBoost inference container it serves with. Only created in Lambda
+    // mode — when flipped to SageMaker training we skip building the image.
+    let trainFn: lambda.DockerImageFunction | undefined;
+    if (!useSagemakerTraining) {
+      const trainName = 'la-metro-train-model';
+      const trainLog = new logs.LogGroup(this, 'TrainModelFnLogs', {
+        logGroupName: `/aws/lambda/${trainName}`,
+        retention: logs.RetentionDays.ONE_WEEK,
+        removalPolicy: cdk.RemovalPolicy.DESTROY,
+      });
+      trainFn = new lambda.DockerImageFunction(this, 'TrainModelFn', {
+        functionName: trainName,
+        code: lambda.DockerImageCode.fromImageAsset(
+          path.join(__dirname, '..', '..', 'lambdas', 'train_model'),
+          { platform: Platform.LINUX_AMD64 },
+        ),
+        architecture: lambda.Architecture.X86_64,
+        memorySize: 3008,            // headroom for xgboost; trains in seconds
+        timeout: cdk.Duration.minutes(5),
+        logGroup: trainLog,
+        description: 'Lambda XGBoost trainer (SageMaker training quota fallback).',
+      });
+      props.archiveBucket.grantRead(trainFn, 'training-sets/*');
+      props.archiveBucket.grantReadWrite(trainFn, 'training-jobs/*');
+    }
+
     // ---- Step Functions state machine ----
     const sfnLog = new logs.LogGroup(this, 'NightlyTrainingSfnLogs', {
       logGroupName: '/aws/vendedlogs/states/la-metro-nightly-training',
@@ -299,6 +336,86 @@ export class MLStack extends cdk.Stack {
       .replace(/'/g, "\\'")
       .replace('${RUN_ID}', '{}');
     const extractQueryString = `States.Format('${sqlForFormat}', $.context.run_id)`;
+
+    const sagemakerTrainState = {
+      Type: 'Task',
+      Resource: 'arn:aws:states:::sagemaker:createTrainingJob.sync',
+      Parameters: {
+        'TrainingJobName.$':
+          "States.Format('la-metro-delay-{}', $.context.run_id)",
+        AlgorithmSpecification: {
+          TrainingImage: '746614075791.dkr.ecr.us-west-2.amazonaws.com/sagemaker-xgboost:1.7-1',
+          TrainingInputMode: 'File',
+          MetricDefinitions: [
+            { Name: 'validation:rmse', Regex: '.*\\[.*\\]#011validation-rmse:([0-9\\.]+).*' },
+            { Name: 'train:rmse',      Regex: '.*\\[.*\\]#011train-rmse:([0-9\\.]+).*' },
+          ],
+        },
+        RoleArn: trainingRole.roleArn,
+        ResourceConfig: { InstanceType: 'ml.m5.large', InstanceCount: 1, VolumeSizeInGB: 10 },
+        StoppingCondition: { MaxRuntimeInSeconds: 600 },
+        HyperParameters: {
+          objective: 'reg:squarederror', num_round: '200',
+          max_depth: '6', eta: '0.1', subsample: '0.8',
+        },
+        InputDataConfig: [{
+          ChannelName: 'train',
+          DataSource: {
+            S3DataSource: {
+              S3DataType: 'S3Prefix',
+              'S3Uri.$':
+                "States.Format('{}/training-sets/run={}/', '" +
+                archiveBucketUri + "', $.context.run_id)",
+              S3DataDistributionType: 'FullyReplicated',
+            },
+          },
+          ContentType: 'text/csv',
+          CompressionType: 'Gzip',
+        }],
+        OutputDataConfig: {
+          'S3OutputPath.$':
+            "States.Format('{}/training-jobs/run={}/', '" +
+            archiveBucketUri + "', $.context.run_id)",
+        },
+      },
+      ResultPath: '$.training',
+      Next: 'Evaluate',
+      Catch: [{ ErrorEquals: ['States.ALL'], Next: 'FailedTerminal' }],
+    };
+
+    const lambdaTrainState = {
+      Type: 'Task',
+      Resource: 'arn:aws:states:::lambda:invoke',
+      Parameters: {
+        FunctionName: trainFn ? trainFn.functionArn : '',
+        Payload: {
+          'training_set_uri.$':
+            "States.Format('{}/training-sets/run={}/', '" +
+            archiveBucketUri + "', $.context.run_id)",
+          'output_model_uri.$':
+            "States.Format('{}/training-jobs/run={}/output/model.tar.gz', '" +
+            archiveBucketUri + "', $.context.run_id)",
+        },
+      },
+      ResultSelector: { 'result.$': '$.Payload' },
+      ResultPath: '$.training',
+      Next: 'Evaluate',
+      Catch: [{ ErrorEquals: ['States.ALL'], Next: 'FailedTerminal' }],
+    };
+
+    const trainState = useSagemakerTraining ? sagemakerTrainState : lambdaTrainState;
+
+    const evaluatePayload = useSagemakerTraining
+      ? {
+          'training_job_name.$': '$.training.TrainingJobName',
+          'models_prefix_uri': `${archiveBucketUri}/models/`,
+        }
+      : {
+          'candidate_metric.$': '$.training.result.candidate_metric',
+          'candidate_model_uri.$': '$.training.result.candidate_model_uri',
+          'metric_name.$': '$.training.result.metric_name',
+          'models_prefix_uri': `${archiveBucketUri}/models/`,
+        };
 
     const definition = {
       Comment: 'Phase 7b nightly training pipeline.',
@@ -348,69 +465,13 @@ export class MLStack extends cdk.Stack {
           Type: 'Succeed',
           Comment: 'Insufficient data; gracefully skipped this run.',
         },
-        Train: {
-          Type: 'Task',
-          Resource: 'arn:aws:states:::sagemaker:createTrainingJob.sync',
-          Parameters: {
-            'TrainingJobName.$':
-              "States.Format('la-metro-delay-{}', $.context.run_id)",
-            AlgorithmSpecification: {
-              // Built-in XGBoost 1.7-1, us-west-2 container. Region-specific —
-              // look up the URI if you deploy elsewhere.
-              TrainingImage: '746614075791.dkr.ecr.us-west-2.amazonaws.com/sagemaker-xgboost:1.7-1',
-              TrainingInputMode: 'File',
-              MetricDefinitions: [
-                { Name: 'validation:rmse', Regex: '.*\\[.*\\]#011validation-rmse:([0-9\\.]+).*' },
-                { Name: 'train:rmse',      Regex: '.*\\[.*\\]#011train-rmse:([0-9\\.]+).*' },
-              ],
-            },
-            RoleArn: trainingRole.roleArn,
-            ResourceConfig: {
-              InstanceType: 'ml.m5.large',
-              InstanceCount: 1,
-              VolumeSizeInGB: 10,
-            },
-            StoppingCondition: { MaxRuntimeInSeconds: 600 },
-            HyperParameters: {
-              objective: 'reg:squarederror',
-              num_round: '200',
-              max_depth: '6',
-              eta: '0.1',
-              subsample: '0.8',
-            },
-            InputDataConfig: [{
-              ChannelName: 'train',
-              DataSource: {
-                S3DataSource: {
-                  S3DataType: 'S3Prefix',
-                  'S3Uri.$':
-                    "States.Format('{}/training-sets/run={}/', '" +
-                    archiveBucketUri + "', $.context.run_id)",
-                  S3DataDistributionType: 'FullyReplicated',
-                },
-              },
-              ContentType: 'text/csv',
-              CompressionType: 'Gzip',
-            }],
-            OutputDataConfig: {
-              'S3OutputPath.$':
-                "States.Format('{}/training-jobs/run={}/', '" +
-                archiveBucketUri + "', $.context.run_id)",
-            },
-          },
-          ResultPath: '$.training',
-          Next: 'Evaluate',
-          Catch: [{ ErrorEquals: ['States.ALL'], Next: 'FailedTerminal' }],
-        },
+        Train: trainState,
         Evaluate: {
           Type: 'Task',
           Resource: 'arn:aws:states:::lambda:invoke',
           Parameters: {
             FunctionName: evaluateFn.functionArn,
-            Payload: {
-              'training_job_name.$': '$.training.TrainingJobName',
-              'models_prefix_uri': `${archiveBucketUri}/models/`,
-            },
+            Payload: evaluatePayload,
           },
           ResultSelector: { 'result.$': '$.Payload' },
           ResultPath: '$.eval',
@@ -489,7 +550,12 @@ export class MLStack extends cdk.Stack {
             }),
             new iam.PolicyStatement({
               actions: ['lambda:InvokeFunction'],
-              resources: [sufficiencyFn.functionArn, evaluateFn.functionArn, promoteFn.functionArn],
+              resources: [
+                sufficiencyFn.functionArn,
+                evaluateFn.functionArn,
+                promoteFn.functionArn,
+                ...(trainFn ? [trainFn.functionArn] : []),
+              ],
             }),
             new iam.PolicyStatement({
               actions: ['events:PutTargets', 'events:PutRule', 'events:DescribeRule'],
