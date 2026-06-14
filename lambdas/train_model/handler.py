@@ -109,3 +109,47 @@ def package_model(booster: Any) -> bytes:
         info.size = len(model_bytes)
         tar.addfile(info, io.BytesIO(model_bytes))
     return buf.getvalue()
+
+
+def _read_training_set(s3, prefix_uri: str) -> bytes:
+    """List + read all CSV parts under the prefix; gunzip; concatenate."""
+    bucket, prefix = _split_s3(prefix_uri)
+    resp = s3.list_objects_v2(Bucket=bucket, Prefix=prefix)
+    parts: list[bytes] = []
+    for obj in resp.get("Contents", []):
+        key = obj["Key"]
+        if key.endswith("/"):
+            continue
+        body = s3.get_object(Bucket=bucket, Key=key)["Body"].read()
+        if key.endswith(".gz"):
+            body = gzip.decompress(body)
+        parts.append(body.rstrip(b"\n"))
+    return b"\n".join(p for p in parts if p) + b"\n"
+
+
+def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
+    training_set_uri = event["training_set_uri"]
+    output_model_uri = event["output_model_uri"]
+
+    s3 = _s3()
+    raw = _read_training_set(s3, training_set_uri)
+    X, y = parse_training_csv(raw)
+    Xtr, ytr, Xval, yval = split(X, y)
+    booster, rmse = train_and_eval(Xtr, ytr, Xval, yval)
+    artifact = package_model(booster)
+
+    out_bucket, out_key = _split_s3(output_model_uri)
+    s3.put_object(
+        Bucket=out_bucket,
+        Key=out_key,
+        Body=artifact,
+        ContentType="application/x-tar",
+    )
+
+    result = {
+        "candidate_metric": rmse,
+        "candidate_model_uri": output_model_uri,
+        "metric_name": METRIC_NAME,
+    }
+    logger.info(str(result))
+    return result
