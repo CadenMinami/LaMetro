@@ -41,3 +41,34 @@ def test_split_single_row_falls_back_to_train_as_val():
     y = np.array([3.0])
     Xtr, ytr, Xval, yval = handler.split(X, y)
     assert len(ytr) == 1 and len(yval) == 1
+
+
+def test_train_and_eval_returns_booster_and_float_rmse():
+    rng = np.random.RandomState(1)
+    X = rng.rand(60, 8)
+    y = X[:, 0] * 100.0 + rng.rand(60)  # learnable signal
+    Xtr, ytr, Xval, yval = handler.split(X, y, seed=0)
+    booster, rmse = handler.train_and_eval(Xtr, ytr, Xval, yval, num_round=20)
+    assert isinstance(rmse, float)
+    assert rmse >= 0.0
+    import xgboost as xgb
+    assert isinstance(booster, xgb.Booster)
+
+
+def test_package_model_contains_xgboost_model_and_round_trips():
+    rng = np.random.RandomState(2)
+    X = rng.rand(40, 8)
+    y = X[:, 0] * 50.0
+    Xtr, ytr, Xval, yval = handler.split(X, y, seed=0)
+    booster, _ = handler.train_and_eval(Xtr, ytr, Xval, yval, num_round=10)
+
+    blob = handler.package_model(booster)
+    with tarfile.open(fileobj=io.BytesIO(blob), mode="r:gz") as tar:
+        names = tar.getnames()
+        assert "xgboost-model" in names
+        member = tar.extractfile("xgboost-model").read()
+    import xgboost as xgb
+    restored = pickle.loads(member)
+    assert isinstance(restored, xgb.Booster)
+    preds = restored.predict(xgb.DMatrix(Xval))
+    assert preds.shape[0] == Xval.shape[0]
