@@ -82,12 +82,20 @@ def _read_deployed_metric(models_prefix_uri: str) -> float | None:
 
 
 def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
-    job_name = event["training_job_name"]
     models_prefix_uri = event["models_prefix_uri"]
 
-    job = _sagemaker().describe_training_job(TrainingJobName=job_name)
-    candidate_metric = extract_validation_metric(job)
-    candidate_model_uri = job.get("ModelArtifacts", {}).get("S3ModelArtifacts")
+    # Lambda training path: the train_model Lambda hands us the metric + URI
+    # directly. SageMaker flip-back path: only training_job_name is present,
+    # so we describe the job to recover them.
+    if event.get("candidate_metric") is not None:
+        candidate_metric: float | None = float(event["candidate_metric"])
+        candidate_model_uri = event.get("candidate_model_uri")
+    else:
+        job = _sagemaker().describe_training_job(
+            TrainingJobName=event["training_job_name"]
+        )
+        candidate_metric = extract_validation_metric(job)
+        candidate_model_uri = job.get("ModelArtifacts", {}).get("S3ModelArtifacts")
 
     deployed_metric = _read_deployed_metric(models_prefix_uri)
 
