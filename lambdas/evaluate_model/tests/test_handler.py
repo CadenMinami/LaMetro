@@ -84,3 +84,29 @@ def test_lambda_handler_existing_better_model_blocks_promotion(monkeypatch):
     assert out["promote"] is False
     assert out["candidate_metric"] == 100.0
     assert out["deployed_metric"] == 90.0
+
+
+def test_lambda_handler_uses_event_metric_without_describing_job(monkeypatch):
+    # Lambda training path: metric + URI arrive in the event; SageMaker is
+    # never called.
+    sm = MagicMock()
+    s3 = MagicMock()
+
+    def _raise(*a, **k):
+        raise type("NoSuchKey", (Exception,), {})()
+    s3.get_object.side_effect = _raise  # no deployed model
+
+    monkeypatch.setattr(handler, "_sagemaker", lambda: sm)
+    monkeypatch.setattr(handler, "_s3", lambda: s3)
+
+    event = {
+        "candidate_metric": 73.5,
+        "candidate_model_uri": "s3://bkt/training-jobs/run=R/output/model.tar.gz",
+        "metric_name": "validation:rmse",
+        "models_prefix_uri": "s3://bkt/models/",
+    }
+    out = handler.lambda_handler(event, MagicMock())
+    assert out["promote"] is True
+    assert out["candidate_metric"] == 73.5
+    assert out["candidate_model_uri"].endswith("/model.tar.gz")
+    sm.describe_training_job.assert_not_called()
