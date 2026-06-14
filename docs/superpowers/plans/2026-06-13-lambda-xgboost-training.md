@@ -10,6 +10,8 @@
 
 **Spec:** `docs/superpowers/specs/2026-06-13-lambda-xgboost-training-design.md`
 
+> **STATUS: COMPLETE (2026-06-13).** All 8 tasks done on branch `phase-7b-training-pipeline`. Pipeline ran end-to-end and promoted a real model (`models/current/model.tar.gz`, validation RMSE 139.84s). Container Lambda trains in ~seconds at ~$0; no SageMaker training instance. **Gotcha hit during deploy:** the changed `evaluate_model` zip asset must be rebuilt (`scripts/build-lambda.sh evaluate_model`) before `cdk deploy`, or the stale `.build/` ships old code (CI rebuilds fresh, so CI was unaffected). This is folded into Task 8 Step 1 below.
+
 ---
 
 ## File map
@@ -828,12 +830,14 @@ git commit -m "CI: document train_model as a container Lambda (excluded from zip
 
 > Cost ≈ $0 (Lambda invoke of a few seconds; no SageMaker instance). Safe to run.
 
-- [ ] **Step 1: Run the full test suite + synth once more**
+- [ ] **Step 1: Rebuild changed zip-lambda assets, then test + synth**
 
 ```bash
-cd /Users/caden/awsProject && pytest && cd cdk && npx tsc --noEmit && npx cdk synth LaMetro-MLStack --quiet
+cd /Users/caden/awsProject
+scripts/build-lambda.sh evaluate_model   # REQUIRED: source changed in Task 5; CDK deploys from .build/
+pytest && cd cdk && npx tsc --noEmit && npx cdk synth LaMetro-MLStack --quiet
 ```
-Expected: all green.
+Expected: all green. (Skipping the rebuild ships stale `evaluate_model` code → `KeyError: 'training_job_name'` at the Evaluate step.)
 
 - [ ] **Step 2: Deploy MLStack (Lambda training mode is the default)**
 
