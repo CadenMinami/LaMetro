@@ -1,0 +1,2 @@
+# boto3 ships in the Lambda runtime; HTTP is via urllib.request stdlib.
+# No third-party deps.

@@ -3,12 +3,13 @@ import 'source-map-support/register';
 import * as cdk from 'aws-cdk-lib';
 import { IngestionStack } from '../lib/ingestion-stack';
 import { BillingStack } from '../lib/billing-stack';
-import { StorageStack } from '../lib/storage-stack';
+import { StorageStack, WEBSOCKET_CONNECTIONS_TABLE_NAME } from '../lib/storage-stack';
 import { ProcessingStack } from '../lib/processing-stack';
 import { ApiStack } from '../lib/api-stack';
 import { FrontendStack } from '../lib/frontend-stack';
 import { WebSocketStack } from '../lib/websocket-stack';
 import { AuthStack } from '../lib/auth-stack';
+import { MLStack } from '../lib/ml-stack';
 
 const app = new cdk.App();
 
@@ -34,6 +35,7 @@ const ingestion = new IngestionStack(app, 'LaMetro-IngestionStack', {
   swiftlySecretName: process.env.SWIFTLY_SECRET_NAME ?? 'la-metro/swiftly-api-key',
   laMetroFeedUrl: process.env.LA_METRO_FEED_URL,
   vehicleStream: storage.vehicleStream,
+  connectionsTableName: WEBSOCKET_CONNECTIONS_TABLE_NAME,
   description: 'LA Metro GTFS-RT ingestion Lambda + EventBridge schedule.',
 });
 
@@ -84,6 +86,14 @@ const frontend = new FrontendStack(app, 'LaMetro-FrontendStack', {
   description: 'Phase 3 frontend: S3 + CloudFront serving the Next.js static export.',
 });
 
+const ml = new MLStack(app, 'LaMetro-MLStack', {
+  env,
+  routeAggregatesTable: storage.routeAggregatesTable,
+  weatherCacheTable: storage.weatherCacheTable,
+  archiveBucket: storage.archiveBucket,
+  description: 'Phase 7a: feature-snapshot Lambda + Glue catalog (extended in 7b/7c).',
+});
+
 // Billing alarms must live in us-east-1 — that's the only region where AWS
 // publishes the AWS/Billing EstimatedCharges metric.
 const billing = new BillingStack(app, 'LaMetro-BillingStack', {
@@ -94,7 +104,7 @@ const billing = new BillingStack(app, 'LaMetro-BillingStack', {
   description: 'Cost guardrails: SNS-backed CloudWatch billing alarms + monthly Budget.',
 });
 
-for (const stack of [storage, auth, ingestion, processing, api, frontend, websocket, billing]) {
+for (const stack of [storage, auth, ingestion, processing, api, frontend, websocket, billing, ml]) {
   for (const [k, v] of Object.entries(tags)) {
     cdk.Tags.of(stack).add(k, v);
   }
