@@ -72,3 +72,65 @@ def test_package_model_contains_xgboost_model_and_round_trips():
     assert isinstance(restored, xgb.Booster)
     preds = restored.predict(xgb.DMatrix(Xval))
     assert preds.shape[0] == Xval.shape[0]
+
+
+def test_read_training_set_concatenates_gzipped_parts():
+    from unittest.mock import MagicMock
+
+    s3 = MagicMock()
+    s3.list_objects_v2.return_value = {
+        "Contents": [
+            {"Key": "training-sets/run=R/part-0.csv.gz"},
+            {"Key": "training-sets/run=R/part-1.csv.gz"},
+        ]
+    }
+    p0 = gzip.compress(b"1.0,2.0,3.0\n")
+    p1 = gzip.compress(b"4.0,5.0,6.0\n")
+    bodies = {"training-sets/run=R/part-0.csv.gz": p0,
+              "training-sets/run=R/part-1.csv.gz": p1}
+
+    def _get(Bucket, Key):
+        body = MagicMock()
+        body.read.return_value = bodies[Key]
+        return {"Body": body}
+
+    s3.get_object.side_effect = _get
+    raw = handler._read_training_set(s3, "s3://bkt/training-sets/run=R/")
+    X, y = handler.parse_training_csv(raw)
+    assert y.tolist() == [1.0, 4.0]
+
+
+def test_lambda_handler_trains_uploads_and_returns_metric(monkeypatch):
+    from unittest.mock import MagicMock
+
+    rng = np.random.RandomState(3)
+    rows = []
+    for _ in range(60):
+        feats = rng.rand(8)
+        label = feats[0] * 100.0
+        rows.append(",".join(str(v) for v in [label, *feats]))
+    csv = ("\n".join(rows) + "\n").encode()
+
+    s3 = MagicMock()
+    s3.list_objects_v2.return_value = {"Contents": [{"Key": "training-sets/run=R/p.csv.gz"}]}
+    body = MagicMock()
+    body.read.return_value = gzip.compress(csv)
+    s3.get_object.return_value = {"Body": body}
+    put_calls = {}
+    s3.put_object.side_effect = lambda **kw: put_calls.update(kw)
+
+    monkeypatch.setattr(handler, "_s3", lambda: s3)
+
+    event = {
+        "training_set_uri": "s3://bkt/training-sets/run=R/",
+        "output_model_uri": "s3://bkt/training-jobs/run=R/output/model.tar.gz",
+    }
+    out = handler.lambda_handler(event, MagicMock())
+
+    assert out["metric_name"] == "validation:rmse"
+    assert isinstance(out["candidate_metric"], float)
+    assert out["candidate_model_uri"] == "s3://bkt/training-jobs/run=R/output/model.tar.gz"
+    assert put_calls["Bucket"] == "bkt"
+    assert put_calls["Key"] == "training-jobs/run=R/output/model.tar.gz"
+    with tarfile.open(fileobj=io.BytesIO(put_calls["Body"]), mode="r:gz") as tar:
+        assert "xgboost-model" in tar.getnames()
