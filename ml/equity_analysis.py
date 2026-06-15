@@ -629,14 +629,9 @@ def main(argv: list[str] | None = None) -> int:
     print("[4/6] Spatial join: served income ...")
     served = served_income(routes_gdf, tracts_gdf)
 
-    # Join reliability (GTFS-RT route_ids) to geometry+served-income (GTFS-static
-    # route_ids) on a normalized key. Match counts are printed so we can verify.
-    reliability["_k"] = reliability["route_id"].map(normalize_route_id)
-    served["_k"] = served["route_id"].map(normalize_route_id)
-    routes_gdf["_k"] = routes_gdf["route_id"].map(normalize_route_id)
-
-    merged = reliability.merge(served[["_k", "served_income"]], on="_k", how="inner")
-    merged = merged.drop_duplicates(subset="_k")
+    # Athena and GTFS route_ids are the same GTFS-RT form (verified 108/108
+    # exact overlap), so we join on route_id directly.
+    merged = reliability.merge(served[["route_id", "served_income"]], on="route_id", how="inner")
     print(f"      {len(merged)} routes matched (reliability x served income)")
 
     print("[5/6] Finding ...")
@@ -650,9 +645,9 @@ def main(argv: list[str] | None = None) -> int:
     tracts_clean = _drop_invalid_income(tracts_gdf)
     tracts_clean = _attach_quartiles(tracts_clean, "median_income", "income_quartile")
     # attach reliability + income bucket to route geometries for the overlay
-    route_attrs = merged[["_k", "on_time_pct", "served_income"]].copy()
+    route_attrs = merged[["route_id", "on_time_pct", "served_income"]].copy()
     route_attrs = _attach_quartiles(route_attrs, "served_income", "income_bucket")
-    routes_out = routes_gdf.merge(route_attrs, on="_k", how="inner").drop_duplicates(subset="_k")
+    routes_out = routes_gdf.merge(route_attrs, on="route_id", how="inner")
 
     tracts_fc, routes_fc = to_geojson_dicts(tracts_clean, routes_out)
     write_outputs(
