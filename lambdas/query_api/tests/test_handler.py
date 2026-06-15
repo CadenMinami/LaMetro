@@ -450,3 +450,16 @@ def test_prediction_route_returns_404_when_missing(monkeypatch):
     }
     resp = qa.lambda_handler(event, MagicMock())
     assert resp["statusCode"] == 404
+
+
+def test_prediction_route_returns_400_when_route_id_missing(monkeypatch):
+    from lambdas.query_api import handler as qa
+    table = MagicMock()
+    monkeypatch.setattr(qa, "_predictions", lambda: table)
+    event = {
+        "resource": "/routes/{routeId}/prediction",
+        "httpMethod": "GET",
+        "pathParameters": {},
+    }
+    resp = qa.lambda_handler(event, MagicMock())
+    assert resp["statusCode"] == 400
