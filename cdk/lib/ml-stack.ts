@@ -345,7 +345,8 @@ export class MLStack extends cdk.Stack {
         'TrainingJobName.$':
           "States.Format('la-metro-delay-{}', $.context.run_id)",
         AlgorithmSpecification: {
-          TrainingImage: '746614075791.dkr.ecr.us-west-2.amazonaws.com/sagemaker-xgboost:1.7-1',
+          // us-west-2 account ID (246618743249); see xgboostImage const below.
+          TrainingImage: '246618743249.dkr.ecr.us-west-2.amazonaws.com/sagemaker-xgboost:1.7-1',
           TrainingInputMode: 'File',
           MetricDefinitions: [
             { Name: 'validation:rmse', Regex: '.*\\[.*\\]#011validation-rmse:([0-9\\.]+).*' },
@@ -480,7 +481,9 @@ export class MLStack extends cdk.Stack {
     }));
 
     const xgboostImage =
-      '746614075791.dkr.ecr.us-west-2.amazonaws.com/sagemaker-xgboost:1.7-1';
+      // us-west-2 SageMaker XGBoost framework image. NOTE: the account ID is
+      // region-specific — 246618743249 is us-west-2 (746614075791 is us-west-1).
+      '246618743249.dkr.ecr.us-west-2.amazonaws.com/sagemaker-xgboost:1.7-1';
 
     // The Model points at models/current/model.tar.gz which must already
     // exist (produced by 7b's first successful pipeline run). If you deploy
