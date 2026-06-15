@@ -496,6 +496,12 @@ export class MLStack extends cdk.Stack {
         modelDataUrl: `s3://${props.archiveBucket.bucketName}/models/current/model.tar.gz`,
       },
     });
+    // CfnModel validates S3 read access to model.tar.gz at create time, but it
+    // only references the role's ARN — CloudFormation doesn't know it also needs
+    // the role's grantRead policy (a separate AWS::IAM::Policy) attached first.
+    // Without this, CFN can create the Model before the policy exists and fail
+    // with AccessDenied. Depend on the role construct (covers its DefaultPolicy).
+    initialModel.node.addDependency(sagemakerExecRole);
 
     const initialEndpointConfig = new cdk.aws_sagemaker.CfnEndpointConfig(
       this, 'InitialEndpointConfig', {
