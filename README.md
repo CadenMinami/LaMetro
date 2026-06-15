@@ -1,6 +1,6 @@
 # LA Metro Reliability Platform
 
-Real-time LA Metro transit reliability platform built on AWS. Ingests live GTFS-Realtime feeds, computes on-time performance, predicts delays with an ML model, and exposes neighborhood-level reliability disparities. Currently in Phase 1 (data ingestion).
+Real-time LA Metro transit reliability platform built on AWS. Ingests live GTFS-Realtime feeds, computes on-time performance, predicts delays with an ML model, and analyzes neighborhood-level reliability disparities. The live pipeline (ingest → Kinesis → enrichment → DynamoDB → SageMaker) and dashboard are deployed; Phases 1–8 are built (Phase 9 polish in progress).
 
 ## Architecture (target state)
 
@@ -11,14 +11,22 @@ GTFS-RT → Kinesis → Lambda (enrichment) → DynamoDB (hot state) + Firehose 
 | Phase | Description | Status |
 |-------|-------------|--------|
 | 1 | Data flowing — Lambda fetches GTFS-RT every 60s | ✅ deployed |
-| 2 | Storage tier — Kinesis + DynamoDB + S3 archive | pending |
-| 3 | Frontend MVP — Next.js + ArcGIS map | pending |
-| 4 | Schedule deviation algorithm | pending |
-| 5 | Real-time WebSocket push | pending |
-| 6 | Cognito auth + SNS geofence alerts | pending |
-| 7 | SageMaker delay predictor + Step Functions retraining | pending |
-| 8 | Equity analysis (ArcGIS Living Atlas + census) | pending |
-| 9 | Polish, demo, README, cost report | pending |
+| 2 | Storage tier — Kinesis + DynamoDB + S3 archive | ✅ deployed |
+| 3 | Frontend MVP — Next.js + ArcGIS map | ✅ deployed |
+| 4 | Schedule deviation algorithm | ✅ deployed |
+| 5 | Real-time WebSocket push | ✅ deployed |
+| 6 | Cognito auth + SNS geofence alerts | ✅ deployed |
+| 7 | SageMaker delay predictor + Step Functions retraining | ✅ deployed |
+| 8 | Equity analysis (ArcGIS Living Atlas + census) | ✅ built (deploy pending) |
+| 9 | Polish, demo, README, cost report | in progress |
+
+## Equity finding (Phase 8)
+
+**Question:** do LA Metro buses serving lower-income neighborhoods run less reliably than those serving wealthier ones?
+
+**Answer: no — and that's the finding.** Joining ~4 weeks of per-route on-time performance to ACS median household income (ArcGIS Living Atlas) across all ~2,495 LA County census tracts, there is **no statistically significant relationship** between neighborhood income and reliability (Pearson r = −0.17, p = 0.07; n = 108 routes). LA Metro is *uniformly* unreliable — ~26% on-time within ±60s — regardless of income. The faint, non-significant trend actually runs **opposite** the usual equity narrative (denser, higher-income job corridors trend slightly *less* reliable), consistent with congestion rather than neighborhood income driving delay. The unreliability is **system-wide, not an income gap**.
+
+**The more interesting story is how that answer held up.** An intermediate run looked significant (r = −0.26, p = 0.009) — but only because the ArcGIS feature service silently capped responses, so the join used just 1,769 of 2,495 tracts. Adding stable-sorted pagination to pull *all* tracts weakened the effect back to non-significant. A result that gets *less* impressive as the data gets *more* complete is exactly the false positive you want to catch before publishing. See [`docs/PHASE_8_EQUITY_FINDING.md`](docs/PHASE_8_EQUITY_FINDING.md); reproduce with `ml/equity_analysis.py`.
 
 ## Local development
 
