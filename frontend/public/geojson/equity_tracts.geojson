@@ -1,0 +1,1 @@
+{"type":"FeatureCollection","features":[{"type":"Feature","geometry":{"type":"Polygon","coordinates":[[[-118.25,34.05],[-118.24,34.05],[-118.24,34.06],[-118.25,34.06],[-118.25,34.05]]]},"properties":{"median_income":55000,"income_quartile":1,"geoid":"placeholder"}}]}
