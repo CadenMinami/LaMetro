@@ -10,6 +10,10 @@ Endpoints:
         Returns recent 5-min-bucket aggregates for one route. Newest first.
         Drives the route detail page in the dashboard.
 
+    GET /routes/{routeId}/prediction
+        Returns the latest precomputed next-window delay prediction for one
+        route (single row from route-predictions), or 404 if none exists.
+
     GET /stops
         Returns the agency's full stops list (lightweight: id/name/lat/lon
         + the route_ids that visit each). Frontend caches per session.
@@ -41,6 +45,7 @@ logger.setLevel(logging.INFO)
 
 HOT_TABLE_NAME = os.environ.get("HOT_VEHICLES_TABLE_NAME", "")
 AGG_TABLE_NAME = os.environ.get("ROUTE_AGGREGATES_TABLE_NAME", "")
+ROUTE_PREDICTIONS_TABLE_NAME = os.environ.get("ROUTE_PREDICTIONS_TABLE_NAME", "")
 GEOHASH_PRECISION = int(os.environ.get("GEOHASH_PRECISION", "6"))
 GTFS_STATIC_BUCKET = os.environ.get("GTFS_STATIC_BUCKET", "")
 GTFS_STATIC_POINTER_KEY = os.environ.get("GTFS_STATIC_POINTER_KEY", "gtfs-static/current.txt")
@@ -69,6 +74,7 @@ GEOHASH_BASE32 = "0123456789bcdefghjkmnpqrstuvwxyz"
 _dynamodb = None
 _hot_table = None
 _agg_table = None
+_predictions_table = None
 _gtfs_static = None
 
 
@@ -110,6 +116,16 @@ def _agg():
         _dynamodb = _dynamodb or boto3.resource("dynamodb")
         _agg_table = _dynamodb.Table(AGG_TABLE_NAME)
     return _agg_table
+
+
+def _predictions():
+    global _dynamodb, _predictions_table
+    if _predictions_table is None:
+        if not ROUTE_PREDICTIONS_TABLE_NAME:
+            raise RuntimeError("ROUTE_PREDICTIONS_TABLE_NAME env var not set")
+        _dynamodb = _dynamodb or boto3.resource("dynamodb")
+        _predictions_table = _dynamodb.Table(ROUTE_PREDICTIONS_TABLE_NAME)
+    return _predictions_table
 
 
 def encode_geohash(lat: float, lon: float, precision: int = GEOHASH_PRECISION) -> str:
@@ -311,6 +327,27 @@ def handle_route_aggregates(event: dict[str, Any]) -> dict:
     return _response(200, {"route_id": route_id, "count": len(windows), "windows": windows})
 
 
+def handle_route_prediction(event: dict[str, Any]) -> dict:
+    path_params = event.get("pathParameters") or {}
+    route_id = path_params.get("routeId") or ""
+    if not route_id:
+        return _response(400, {"error": "missing_route_id"})
+    resp = _predictions().get_item(Key={"route_id": route_id})
+    item = resp.get("Item")
+    if not item:
+        return _response(404, {"error": "no_prediction", "route_id": route_id})
+    return _response(200, {
+        "route_id": item.get("route_id"),
+        "predicted_next_window_avg_delay_seconds":
+            _decimal_to_number(item.get("predicted_next_window_avg_delay_seconds")),
+        "current_avg_delay_seconds":
+            _decimal_to_number(item.get("current_avg_delay_seconds")),
+        "model_version": item.get("model_version"),
+        "window_start_iso": item.get("window_start_iso"),
+        "as_of": item.get("as_of"),
+    })
+
+
 def _routes_per_stop(static) -> dict[str, list[str]]:
     """Pivot stop_arrivals into a stable {stop_id: [route_id, ...]} mapping.
 
@@ -496,6 +533,8 @@ def lambda_handler(event: dict[str, Any], context: Any) -> dict:
         return handle_vehicles(event)
     if resource == "/routes/{routeId}/aggregates":
         return handle_route_aggregates(event)
+    if resource == "/routes/{routeId}/prediction":
+        return handle_route_prediction(event)
     if resource == "/stops":
         return handle_list_stops(event)
     if resource == "/stops/{stopId}/arrivals":

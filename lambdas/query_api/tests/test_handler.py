@@ -411,3 +411,42 @@ def test_arrivals_dedup_per_trip_keeps_freshest(frozen_now):
     a = json.loads(resp["body"])["arrivals"][0]
     assert a["vehicle_id"] == "fresh"
     assert a["delay_seconds"] == 60
+
+
+def test_prediction_route_returns_row_when_present(monkeypatch):
+    from lambdas.query_api import handler as qa
+    table = MagicMock()
+    table.get_item.return_value = {"Item": {
+        "route_id": "720",
+        "predicted_next_window_avg_delay_seconds": Decimal("132"),
+        "current_avg_delay_seconds": Decimal("75"),
+        "model_version": "v=2026-06-15",
+        "window_start_iso": "2026-05-27T12:05:00Z",
+        "as_of": "2026-05-27T12:06:30Z",
+    }}
+    monkeypatch.setattr(qa, "_predictions", lambda: table)
+    event = {
+        "resource": "/routes/{routeId}/prediction",
+        "httpMethod": "GET",
+        "pathParameters": {"routeId": "720"},
+    }
+    resp = qa.lambda_handler(event, MagicMock())
+    assert resp["statusCode"] == 200
+    body = json.loads(resp["body"])
+    assert body["route_id"] == "720"
+    assert body["predicted_next_window_avg_delay_seconds"] == 132
+    assert body["current_avg_delay_seconds"] == 75
+
+
+def test_prediction_route_returns_404_when_missing(monkeypatch):
+    from lambdas.query_api import handler as qa
+    table = MagicMock()
+    table.get_item.return_value = {}
+    monkeypatch.setattr(qa, "_predictions", lambda: table)
+    event = {
+        "resource": "/routes/{routeId}/prediction",
+        "httpMethod": "GET",
+        "pathParameters": {"routeId": "720"},
+    }
+    resp = qa.lambda_handler(event, MagicMock())
+    assert resp["statusCode"] == 404
