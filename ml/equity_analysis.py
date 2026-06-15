@@ -358,3 +358,316 @@ def _num(v: Any) -> Any:
     if f == int(f):
         return int(f)
     return round(f, 3)
+
+
+# ===========================================================================
+# I/O layer (Athena / GTFS-S3 / ArcGIS / file+S3 output). Exercised by main();
+# not unit-tested (external dependencies).
+# ===========================================================================
+
+import os  # noqa: E402
+
+ATHENA_DATABASE = "la_metro"
+ATHENA_TABLE = "route_window_features"
+ATHENA_WORKGROUP = os.environ.get("ATHENA_WORKGROUP", "primary")
+
+# ArcGIS Living Atlas income layer — VERIFY against the real layer at run time
+# (field names + the county filter vary between layers). Overridable via env.
+ARCGIS_URL = os.environ.get("ARCGIS_URL", "https://www.arcgis.com")
+# A feature-layer URL (preferred) OR an item id, pointing at ACS median
+# household income by census tract.
+INCOME_LAYER_URL = os.environ.get("EQUITY_INCOME_LAYER_URL", "")
+INCOME_ITEM_ID = os.environ.get("EQUITY_INCOME_ITEM_ID", "")
+INCOME_FIELD = os.environ.get("EQUITY_INCOME_FIELD", "B19013_001E")
+GEOID_FIELD = os.environ.get("EQUITY_GEOID_FIELD", "GEOID")
+# LA County = state FIPS 06, county FIPS 037.
+INCOME_WHERE = os.environ.get("EQUITY_INCOME_WHERE", "STATE = '06' AND COUNTY = '037'")
+
+
+def run_athena_query(athena, sql: str, output_location: str) -> list[dict[str, Any]]:
+    """Run a query to completion and return result rows as dicts (all string
+    values; cast downstream). Raises on FAILED/CANCELLED."""
+    import time
+
+    start_kwargs: dict[str, Any] = {
+        "QueryString": sql,
+        "WorkGroup": ATHENA_WORKGROUP,
+        "ResultConfiguration": {"OutputLocation": output_location},
+    }
+    try:
+        qid = athena.start_query_execution(**start_kwargs)["QueryExecutionId"]
+    except athena.exceptions.ClientError as exc:  # workgroup may enforce output
+        if "ResultConfiguration" in str(exc) or "WorkGroup" in str(exc):
+            start_kwargs.pop("ResultConfiguration")
+            qid = athena.start_query_execution(**start_kwargs)["QueryExecutionId"]
+        else:
+            raise
+
+    while True:
+        info = athena.get_query_execution(QueryExecutionId=qid)["QueryExecution"]
+        state = info["Status"]["State"]
+        if state in ("SUCCEEDED", "FAILED", "CANCELLED"):
+            break
+        time.sleep(2)
+    if state != "SUCCEEDED":
+        reason = info["Status"].get("StateChangeReason", "")
+        raise RuntimeError(f"Athena query {state}: {reason}")
+
+    rows: list[dict[str, Any]] = []
+    header: list[str] | None = None
+    paginator = athena.get_paginator("get_query_results")
+    for page in paginator.paginate(QueryExecutionId=qid):
+        for r in page["ResultSet"]["Rows"]:
+            values = [c.get("VarCharValue") for c in r["Data"]]
+            if header is None:
+                header = values
+                continue
+            rows.append(dict(zip(header, values)))
+    return rows
+
+
+def reliability_sql(start_yyyymmdd: int, end_yyyymmdd: int) -> str:
+    """Per-route-per-day vehicle-count-weighted on-time % + avg delay over the
+    window. Day-level keeps the result small (~routes * days); aggregate_on_time
+    does the final weighted rollup."""
+    return f"""
+SELECT route_id,
+       SUM(on_time_pct * vehicle_count) / SUM(vehicle_count) AS on_time_pct,
+       SUM(avg_delay_seconds * CAST(vehicle_count AS double)) / SUM(vehicle_count) AS avg_delay_seconds,
+       SUM(vehicle_count) AS vehicle_count
+FROM {ATHENA_DATABASE}.{ATHENA_TABLE}
+WHERE (year * 10000 + month * 100 + day) BETWEEN {start_yyyymmdd} AND {end_yyyymmdd}
+  AND on_time_pct IS NOT NULL
+  AND vehicle_count > 0
+GROUP BY route_id, year, month, day
+""".strip()
+
+
+def load_gtfs_raw(s3, bucket: str, current_key: str = "gtfs-static/current.txt") -> dict[str, Any]:
+    """Read the raw parsed GTFS pickle (NOT via gtfs_static.build_static, which
+    reprojects shapes). Returns the dict with 'trips' and 'shapes'."""
+    import pickle
+
+    pointer = s3.get_object(Bucket=bucket, Key=current_key)["Body"].read().decode("utf-8").strip()
+    parsed = pickle.loads(s3.get_object(Bucket=bucket, Key=pointer)["Body"].read())
+    return parsed
+
+
+def fetch_income_tracts(gis) -> "Any":
+    """Query the ArcGIS Living Atlas income layer for LA County tracts and
+    return a GeoDataFrame (WGS84) with columns median_income, geoid, geometry.
+
+    NOTE: INCOME_LAYER_URL/ITEM_ID + INCOME_FIELD + INCOME_WHERE must match the
+    actual layer — verify interactively on first run.
+    """
+    import json
+    import geopandas as gpd
+    from arcgis.features import FeatureLayer
+
+    if INCOME_LAYER_URL:
+        layer = FeatureLayer(INCOME_LAYER_URL, gis=gis)
+    elif INCOME_ITEM_ID:
+        layer = gis.content.get(INCOME_ITEM_ID).layers[0]
+    else:
+        raise RuntimeError(
+            "Set EQUITY_INCOME_LAYER_URL or EQUITY_INCOME_ITEM_ID to the ACS "
+            "median-household-income tract layer."
+        )
+
+    fset = layer.query(
+        where=INCOME_WHERE,
+        out_fields=f"{INCOME_FIELD},{GEOID_FIELD}",
+        return_geometry=True,
+        out_sr=4326,
+    )
+    features = json.loads(fset.to_geojson)["features"]
+    gdf = gpd.GeoDataFrame.from_features(features, crs=WGS84)
+    gdf = gdf.rename(columns={INCOME_FIELD: "median_income", GEOID_FIELD: "geoid"})
+    return gdf[["median_income", "geoid", "geometry"]]
+
+
+def build_finding_doc(finding: dict[str, Any], start: str, end: str) -> str:
+    """Render the narrative finding as Markdown for docs/."""
+    g = finding
+    direction = "less" if g.get("gap_pct_points", 0) > 0 else "more"
+    return f"""# Phase 8 — Transit Equity Finding
+
+**Date:** generated by `ml/equity_analysis.py`
+**Window:** {start} to {end} (~4 weeks of archived LA Metro vehicle data)
+**Routes analyzed:** {g.get('n_routes', 'n/a')}
+
+## Headline
+
+LA Metro routes serving the **lowest-income** neighborhoods were on time
+**{g.get('bottom_quartile_on_time_pct', 'n/a')}%** of the time, versus
+**{g.get('top_quartile_on_time_pct', 'n/a')}%** for routes serving the
+**highest-income** neighborhoods — a gap of
+**{abs(g.get('gap_pct_points', 0))} percentage points** ({direction} reliable
+for lower-income areas).
+
+- Bottom income quartile mean served income: ${g.get('bottom_quartile_income', 'n/a'):,}
+- Top income quartile mean served income: ${g.get('top_quartile_income', 'n/a'):,}
+- Pearson r (served income vs on-time %): **{g.get('pearson_r', 'n/a')}** (p = {g.get('pearson_p', 'n/a'):.4g})
+- Spearman rho: **{g.get('spearman_rho', 'n/a')}** (p = {g.get('spearman_p', 'n/a'):.4g})
+
+## Method (see the approved plan for detail)
+
+1. On-time % per route from {g.get('n_routes', '?')} routes over the window
+   (Athena over `route_window_features`, vehicle-count-weighted; on-time =
+   within +/- 60s of schedule; routes with < {MIN_ROUTE_VEHICLE_COUNT} observations dropped).
+2. Each route mapped to its longest GTFS shape; intersected with census tracts
+   (projected to EPSG:26911 for accurate length).
+3. "Served income" = length-weighted mean median household income (ACS, via
+   ArcGIS Living Atlas) of the tracts each route traverses.
+4. Routes bucketed into income quartiles; quartile gap + correlations computed.
+
+## Caveats
+
+- ~4-week window (not a full year); a snapshot, not a seasonal average.
+- Representative-shape choice (longest pattern) approximates multi-variant routes.
+- Income is ACS tract-level median household income; tract != exact rider income.
+"""
+
+
+def write_outputs(
+    *,
+    tracts_fc: dict[str, Any],
+    routes_fc: dict[str, Any],
+    finding: dict[str, Any],
+    finding_doc: str,
+    public_dir: str,
+    docs_path: str,
+    s3=None,
+    archive_bucket: str = "",
+) -> None:
+    """Write the two bundled GeoJSONs + finding.json to the frontend, the
+    narrative doc to docs/, and a combined GeoJSON archive to S3."""
+    os.makedirs(public_dir, exist_ok=True)
+    with open(os.path.join(public_dir, "equity_tracts.geojson"), "w") as f:
+        json.dump(tracts_fc, f)
+    with open(os.path.join(public_dir, "equity_routes.geojson"), "w") as f:
+        json.dump(routes_fc, f)
+    with open(os.path.join(public_dir, "equity_finding.json"), "w") as f:
+        json.dump(finding, f, indent=2)
+    with open(docs_path, "w") as f:
+        f.write(finding_doc)
+
+    if s3 and archive_bucket:
+        combined = {
+            "type": "FeatureCollection",
+            "features": [
+                {**ft, "properties": {**ft["properties"], "kind": "tract"}}
+                for ft in tracts_fc["features"]
+            ]
+            + [
+                {**ft, "properties": {**ft["properties"], "kind": "route"}}
+                for ft in routes_fc["features"]
+            ],
+        }
+        s3.put_object(
+            Bucket=archive_bucket,
+            Key="equity-analysis/equity.geojson",
+            Body=json.dumps(combined).encode("utf-8"),
+            ContentType="application/geo+json",
+        )
+
+
+def _attach_quartiles(df: "Any", value_col: str, out_col: str, n: int = 4) -> "Any":
+    import pandas as pd
+
+    df = df.copy()
+    df[out_col] = pd.qcut(df[value_col], n, labels=False, duplicates="drop")
+    return df
+
+
+def main(argv: list[str] | None = None) -> int:
+    import argparse
+
+    import boto3
+    import pandas as pd
+
+    parser = argparse.ArgumentParser(description="Phase 8 transit equity analysis")
+    parser.add_argument("--bucket", required=True, help="archive S3 bucket name")
+    parser.add_argument("--start", default="20260507", help="window start YYYYMMDD")
+    parser.add_argument("--end", default="20260603", help="window end YYYYMMDD")
+    parser.add_argument(
+        "--public-dir",
+        default=os.path.join(os.path.dirname(__file__), "..", "frontend", "public", "geojson"),
+    )
+    parser.add_argument(
+        "--docs-path",
+        default=os.path.join(os.path.dirname(__file__), "..", "docs", "PHASE_8_EQUITY_FINDING.md"),
+    )
+    args = parser.parse_args(argv)
+
+    from arcgis.gis import GIS
+
+    username = os.environ.get("ARCGIS_USERNAME")
+    password = os.environ.get("ARCGIS_PASSWORD")
+    if not (username and password):
+        raise RuntimeError("Set ARCGIS_USERNAME and ARCGIS_PASSWORD env vars.")
+
+    athena = boto3.client("athena")
+    s3 = boto3.client("s3")
+
+    print("[1/6] Athena: per-route on-time %% ...")
+    output_loc = f"s3://{args.bucket}/athena-results/"
+    rows = run_athena_query(athena, reliability_sql(int(args.start), int(args.end)), output_loc)
+    reliability = aggregate_on_time(rows)
+    print(f"      {len(reliability)} routes after min-count filter")
+
+    print("[2/6] GTFS: route shapes ...")
+    parsed = load_gtfs_raw(s3, args.bucket)
+    routes_gdf = build_route_lines(parsed["trips"], parsed["shapes"])
+    print(f"      {len(routes_gdf)} route geometries")
+
+    print("[3/6] ArcGIS: census-tract income ...")
+    gis = GIS(ARCGIS_URL, username, password)
+    tracts_gdf = fetch_income_tracts(gis)
+    print(f"      {len(tracts_gdf)} tracts")
+
+    print("[4/6] Spatial join: served income ...")
+    served = served_income(routes_gdf, tracts_gdf)
+
+    # Join reliability (GTFS-RT route_ids) to geometry+served-income (GTFS-static
+    # route_ids) on a normalized key. Match counts are printed so we can verify.
+    reliability["_k"] = reliability["route_id"].map(normalize_route_id)
+    served["_k"] = served["route_id"].map(normalize_route_id)
+    routes_gdf["_k"] = routes_gdf["route_id"].map(normalize_route_id)
+
+    merged = reliability.merge(served[["_k", "served_income"]], on="_k", how="inner")
+    merged = merged.drop_duplicates(subset="_k")
+    print(f"      {len(merged)} routes matched (reliability x served income)")
+
+    print("[5/6] Finding ...")
+    finding = equity_finding(merged[["route_id", "on_time_pct", "served_income"]])
+    finding["window_start"] = args.start
+    finding["window_end"] = args.end
+    print("      ", {k: finding[k] for k in ("gap_pct_points", "pearson_r", "spearman_rho") if k in finding})
+
+    print("[6/6] GeoJSON + outputs ...")
+    # tract quartiles for the choropleth class breaks
+    tracts_clean = _drop_invalid_income(tracts_gdf)
+    tracts_clean = _attach_quartiles(tracts_clean, "median_income", "income_quartile")
+    # attach reliability + income bucket to route geometries for the overlay
+    route_attrs = merged[["_k", "on_time_pct", "served_income"]].copy()
+    route_attrs = _attach_quartiles(route_attrs, "served_income", "income_bucket")
+    routes_out = routes_gdf.merge(route_attrs, on="_k", how="inner").drop_duplicates(subset="_k")
+
+    tracts_fc, routes_fc = to_geojson_dicts(tracts_clean, routes_out)
+    write_outputs(
+        tracts_fc=tracts_fc,
+        routes_fc=routes_fc,
+        finding=finding,
+        finding_doc=build_finding_doc(finding, args.start, args.end),
+        public_dir=os.path.abspath(args.public_dir),
+        docs_path=os.path.abspath(args.docs_path),
+        s3=s3,
+        archive_bucket=args.bucket,
+    )
+    print(f"      tracts={len(tracts_fc['features'])} routes={len(routes_fc['features'])} -> done")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
