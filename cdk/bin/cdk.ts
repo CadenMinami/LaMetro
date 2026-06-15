@@ -77,6 +77,7 @@ const api = new ApiStack(app, 'LaMetro-ApiStack', {
   usersTable: storage.usersTable,
   geofencesTable: storage.geofencesTable,
   notificationsTable: storage.notificationsTable,
+  routePredictionsTable: storage.routePredictionsTable,
   description:
     'Read API (/vehicles, /routes, /stops) + Cognito-authorized user API (/geofences, /notifications, /me).',
 });
@@ -91,6 +92,7 @@ const ml = new MLStack(app, 'LaMetro-MLStack', {
   routeAggregatesTable: storage.routeAggregatesTable,
   weatherCacheTable: storage.weatherCacheTable,
   archiveBucket: storage.archiveBucket,
+  routePredictionsTable: storage.routePredictionsTable,
   description: 'Phase 7a: feature-snapshot Lambda + Glue catalog (extended in 7b/7c).',
 });
 

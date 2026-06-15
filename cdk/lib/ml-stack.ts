@@ -18,6 +18,7 @@ export interface MLStackProps extends cdk.StackProps {
   routeAggregatesTable: dynamodb.ITable;
   weatherCacheTable: dynamodb.ITable;
   archiveBucket: s3.IBucket;
+  routePredictionsTable: dynamodb.ITable;
 }
 
 /**
@@ -417,6 +418,141 @@ export class MLStack extends cdk.Stack {
           'models_prefix_uri': `${archiveBucketUri}/models/`,
         };
 
+    // ---- precompute-predictions Lambda + 5-min schedule ----
+    const preName = 'la-metro-precompute-predictions';
+    const preLog = new logs.LogGroup(this, 'PrecomputeFnLogs', {
+      logGroupName: `/aws/lambda/${preName}`,
+      retention: logs.RetentionDays.ONE_WEEK,
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+    });
+    const endpointName = 'la-metro-delay-predictor';
+    const precomputeFn = new lambda.Function(this, 'PrecomputeFn', {
+      functionName: preName,
+      runtime: lambda.Runtime.PYTHON_3_12,
+      architecture: lambda.Architecture.ARM_64,
+      handler: 'handler.lambda_handler',
+      code: lambda.Code.fromAsset(
+        path.join(__dirname, '..', '..', 'lambdas', 'precompute_predictions', '.build'),
+      ),
+      memorySize: 512,
+      // 60s: scan + 150 endpoint invokes + 150 DDB puts. Plenty of cushion.
+      timeout: cdk.Duration.seconds(60),
+      environment: {
+        ROUTE_AGGREGATES_TABLE_NAME: props.routeAggregatesTable.tableName,
+        ROUTE_PREDICTIONS_TABLE_NAME: props.routePredictionsTable.tableName,
+        WEATHER_CACHE_TABLE_NAME: props.weatherCacheTable.tableName,
+        MODELS_PREFIX_URI: `s3://${props.archiveBucket.bucketName}/models`,
+        SAGEMAKER_ENDPOINT_NAME: endpointName,
+        PREDICTION_TTL_SECONDS: '900',
+      },
+      logGroup: preLog,
+      description: 'Phase 7c: per-route prediction precompute (5 min).',
+    });
+    // grantReadData covers Query + Scan + GetItem on the BASE table, which is
+    // all the precompute Lambda needs (route-aggregates PK is route_id; no GSI).
+    props.routeAggregatesTable.grantReadData(precomputeFn);
+    props.routePredictionsTable.grantWriteData(precomputeFn);
+    props.weatherCacheTable.grantReadData(precomputeFn);
+    props.archiveBucket.grantRead(precomputeFn, 'models/*');
+    precomputeFn.addToRolePolicy(new iam.PolicyStatement({
+      actions: ['sagemaker:InvokeEndpoint'],
+      resources: [
+        `arn:aws:sagemaker:${this.region}:${this.account}:endpoint/${endpointName}`,
+      ],
+    }));
+
+    new events.Rule(this, 'PrecomputeSchedule', {
+      ruleName: 'la-metro-precompute-predictions-schedule',
+      schedule: events.Schedule.rate(cdk.Duration.minutes(5)),
+      targets: [new targets.LambdaFunction(precomputeFn)],
+      description: 'Phase 7c: triggers precompute every 5 min.',
+    });
+
+    // ---- SageMaker Serverless endpoint ----
+    const sagemakerExecRole = new iam.Role(this, 'SageMakerExecutionRole', {
+      assumedBy: new iam.ServicePrincipal('sagemaker.amazonaws.com'),
+      description: 'Phase 7c: SageMaker endpoint execution role (reads models/*).',
+    });
+    props.archiveBucket.grantRead(sagemakerExecRole, 'models/*');
+    sagemakerExecRole.addToPolicy(new iam.PolicyStatement({
+      actions: ['logs:CreateLogStream', 'logs:PutLogEvents'],
+      resources: ['*'],
+    }));
+
+    const xgboostImage =
+      '746614075791.dkr.ecr.us-west-2.amazonaws.com/sagemaker-xgboost:1.7-1';
+
+    // The Model points at models/current/model.tar.gz which must already
+    // exist (produced by 7b's first successful pipeline run). If you deploy
+    // 7c before 7b has run, CreateModel will fail with NoSuchKey.
+    const initialModel = new cdk.aws_sagemaker.CfnModel(this, 'InitialModel', {
+      modelName: 'la-metro-delay-predictor-initial',
+      executionRoleArn: sagemakerExecRole.roleArn,
+      primaryContainer: {
+        image: xgboostImage,
+        modelDataUrl: `s3://${props.archiveBucket.bucketName}/models/current/model.tar.gz`,
+      },
+    });
+
+    const initialEndpointConfig = new cdk.aws_sagemaker.CfnEndpointConfig(
+      this, 'InitialEndpointConfig', {
+        endpointConfigName: 'la-metro-delay-predictor-cfg-initial',
+        productionVariants: [{
+          variantName: 'AllTraffic',
+          modelName: initialModel.attrModelName,
+          serverlessConfig: { memorySizeInMb: 1024, maxConcurrency: 5 },
+        }],
+      },
+    );
+    initialEndpointConfig.addDependency(initialModel);
+
+    const endpoint = new cdk.aws_sagemaker.CfnEndpoint(this, 'Endpoint', {
+      endpointName,
+      endpointConfigName: initialEndpointConfig.attrEndpointConfigName,
+    });
+    endpoint.addDependency(initialEndpointConfig);
+
+    new cdk.CfnOutput(this, 'SagemakerEndpointName', { value: endpointName });
+
+    // ---- update_endpoint Lambda (called from Step Functions after Promote) ----
+    const upName = 'la-metro-update-endpoint';
+    const upLog = new logs.LogGroup(this, 'UpdateEndpointFnLogs', {
+      logGroupName: `/aws/lambda/${upName}`,
+      retention: logs.RetentionDays.ONE_WEEK,
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+    });
+    const updateEndpointFn = new lambda.Function(this, 'UpdateEndpointFn', {
+      functionName: upName,
+      runtime: lambda.Runtime.PYTHON_3_12,
+      architecture: lambda.Architecture.ARM_64,
+      handler: 'handler.lambda_handler',
+      code: lambda.Code.fromAsset(
+        path.join(__dirname, '..', '..', 'lambdas', 'update_endpoint', '.build'),
+      ),
+      memorySize: 256,
+      timeout: cdk.Duration.seconds(30),
+      environment: {
+        SAGEMAKER_ENDPOINT_NAME: endpointName,
+        TRAINING_IMAGE: xgboostImage,
+        SAGEMAKER_EXECUTION_ROLE_ARN: sagemakerExecRole.roleArn,
+        ENDPOINT_MEMORY_MB: '1024',
+        ENDPOINT_MAX_CONCURRENCY: '5',
+      },
+      logGroup: upLog,
+      description: 'Phase 7c: refresh SageMaker endpoint to a freshly-promoted model.',
+    });
+    updateEndpointFn.addToRolePolicy(new iam.PolicyStatement({
+      actions: [
+        'sagemaker:CreateModel', 'sagemaker:CreateEndpointConfig',
+        'sagemaker:UpdateEndpoint',
+      ],
+      resources: ['*'],
+    }));
+    updateEndpointFn.addToRolePolicy(new iam.PolicyStatement({
+      actions: ['iam:PassRole'],
+      resources: [sagemakerExecRole.roleArn],
+    }));
+
     const definition = {
       Comment: 'Phase 7b nightly training pipeline.',
       StartAt: 'GenerateRunId',
@@ -504,6 +640,20 @@ export class MLStack extends cdk.Stack {
           },
           ResultSelector: { 'result.$': '$.Payload' },
           ResultPath: '$.promote',
+          Next: 'UpdateEndpoint',
+        },
+        UpdateEndpoint: {
+          Type: 'Task',
+          Resource: 'arn:aws:states:::lambda:invoke',
+          Parameters: {
+            FunctionName: updateEndpointFn.functionArn,
+            Payload: {
+              'promoted_version.$': '$.promote.result.promoted_version',
+              'current_model_uri.$': '$.promote.result.current_model_uri',
+            },
+          },
+          ResultSelector: { 'result.$': '$.Payload' },
+          ResultPath: '$.endpoint',
           End: true,
         },
         FailedTerminal: {
@@ -554,6 +704,7 @@ export class MLStack extends cdk.Stack {
                 sufficiencyFn.functionArn,
                 evaluateFn.functionArn,
                 promoteFn.functionArn,
+                updateEndpointFn.functionArn,
                 ...(trainFn ? [trainFn.functionArn] : []),
               ],
             }),
