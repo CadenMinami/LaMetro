@@ -11,6 +11,7 @@ import * as cognito from 'aws-cdk-lib/aws-cognito';
 export interface ApiStackProps extends cdk.StackProps {
   hotVehiclesTable: dynamodb.ITable;
   routeAggregatesTable: dynamodb.ITable;
+  routePredictionsTable: dynamodb.ITable;
   // Phase 4d: archive bucket holds the parsed GTFS-static pickle the
   // arrivals API loads. The Lambda only needs read access under the
   // `gtfs-static/` prefix.
@@ -68,6 +69,7 @@ export class ApiStack extends cdk.Stack {
       environment: {
         HOT_VEHICLES_TABLE_NAME: props.hotVehiclesTable.tableName,
         ROUTE_AGGREGATES_TABLE_NAME: props.routeAggregatesTable.tableName,
+        ROUTE_PREDICTIONS_TABLE_NAME: props.routePredictionsTable.tableName,
         GEOHASH_PRECISION: '6',
         GTFS_STATIC_BUCKET: props.archiveBucket.bucketName,
         GTFS_STATIC_POINTER_KEY: 'gtfs-static/current.txt',
@@ -83,6 +85,7 @@ export class ApiStack extends cdk.Stack {
 
     props.hotVehiclesTable.grantReadData(queryFn);
     props.routeAggregatesTable.grantReadData(queryFn);
+    props.routePredictionsTable.grantReadData(queryFn);
     // Scope the S3 read grant to the gtfs-static prefix only — the Lambda has
     // no business reading raw vehicle archives.
     props.archiveBucket.grantRead(queryFn, 'gtfs-static/*');
@@ -131,6 +134,8 @@ export class ApiStack extends cdk.Stack {
     const routeById = routes.addResource('{routeId}');
     const aggregates = routeById.addResource('aggregates');
     aggregates.addMethod('GET');
+    const prediction = routeById.addResource('prediction');
+    prediction.addMethod('GET');   // public, uses the default queryFn handler
 
     // Phase 4d: /stops and /stops/{stopId}/arrivals
     const stops = api.root.addResource('stops');
