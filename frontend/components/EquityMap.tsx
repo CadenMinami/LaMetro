@@ -37,6 +37,7 @@ interface Finding {
   top_quartile_on_time_pct: number | null;
   gap_pct_points: number | null;
   pearson_r: number | null;
+  pearson_p?: number | null;
   spearman_rho: number | null;
   bottom_quartile_income?: number | null;
   top_quartile_income?: number | null;
@@ -145,6 +146,8 @@ export default function EquityMap() {
   }, []);
 
   const hasFinding = finding && !finding.placeholder && finding.gap_pct_points != null;
+  const significant =
+    hasFinding && finding!.pearson_p != null && (finding!.pearson_p as number) < 0.05;
 
   return (
     <div className="relative h-screen w-screen overflow-hidden">
@@ -169,29 +172,51 @@ export default function EquityMap() {
           <div className="border-t border-white/[0.06] px-4 py-3.5">
             {hasFinding ? (
               <>
-                <p className="text-sm leading-relaxed text-zinc-200">
-                  Routes serving LA&apos;s{' '}
-                  <span className="font-semibold text-zinc-50">lowest-income</span>{' '}
-                  neighborhoods ran on time{' '}
-                  <span className="font-mono text-zinc-50">
-                    {finding!.bottom_quartile_on_time_pct}%
-                  </span>{' '}
-                  of the time, vs{' '}
-                  <span className="font-mono text-zinc-50">
-                    {finding!.top_quartile_on_time_pct}%
-                  </span>{' '}
-                  for the{' '}
-                  <span className="font-semibold text-zinc-50">highest-income</span> —
-                  a{' '}
-                  <span className="font-mono text-amber-300">
-                    {Math.abs(finding!.gap_pct_points as number)} pt
-                  </span>{' '}
-                  gap.
-                </p>
+                {significant ? (
+                  <p className="text-sm leading-relaxed text-zinc-200">
+                    Routes serving LA&apos;s{' '}
+                    <span className="font-semibold text-zinc-50">lowest-income</span>{' '}
+                    neighborhoods ran on time{' '}
+                    <span className="font-mono text-zinc-50">
+                      {finding!.bottom_quartile_on_time_pct}%
+                    </span>{' '}
+                    of the time, vs{' '}
+                    <span className="font-mono text-zinc-50">
+                      {finding!.top_quartile_on_time_pct}%
+                    </span>{' '}
+                    for the{' '}
+                    <span className="font-semibold text-zinc-50">highest-income</span> — a{' '}
+                    <span className="font-mono text-amber-300">
+                      {Math.abs(finding!.gap_pct_points as number)} pt
+                    </span>{' '}
+                    gap.
+                  </p>
+                ) : (
+                  <p className="text-sm leading-relaxed text-zinc-200">
+                    <span className="font-semibold text-zinc-50">
+                      No significant link between neighborhood income and reliability.
+                    </span>{' '}
+                    LA Metro is uniformly unreliable —{' '}
+                    <span className="font-mono text-zinc-50">
+                      {finding!.bottom_quartile_on_time_pct}%
+                    </span>{' '}
+                    on-time in the lowest-income quartile vs{' '}
+                    <span className="font-mono text-zinc-50">
+                      {finding!.top_quartile_on_time_pct}%
+                    </span>{' '}
+                    in the highest. The unreliability is system-wide, not an income gap.
+                  </p>
+                )}
                 <div className="mt-2 text-[11px] leading-snug text-zinc-500">
                   n = {finding!.n_routes} routes · Pearson r ={' '}
-                  <span className="font-mono">{finding!.pearson_r}</span> · Spearman ρ ={' '}
-                  <span className="font-mono">{finding!.spearman_rho}</span>
+                  <span className="font-mono">{finding!.pearson_r}</span>
+                  {finding!.pearson_p != null && (
+                    <>
+                      {' '}
+                      (p = <span className="font-mono">{finding!.pearson_p.toFixed(2)}</span>,{' '}
+                      {significant ? 'significant' : 'n.s.'})
+                    </>
+                  )}
                 </div>
               </>
             ) : (

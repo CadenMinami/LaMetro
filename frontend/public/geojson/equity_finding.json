@@ -1,1 +1,15 @@
-{"placeholder": true, "n_routes": null, "bottom_quartile_on_time_pct": null, "top_quartile_on_time_pct": null, "gap_pct_points": null, "pearson_r": null, "spearman_rho": null}
+{
+  "n_routes": 108,
+  "n_buckets": 4,
+  "bottom_quartile_on_time_pct": 27.0,
+  "top_quartile_on_time_pct": 25.9,
+  "gap_pct_points": -1.1,
+  "bottom_quartile_income": 65076.0,
+  "top_quartile_income": 119360.0,
+  "pearson_r": -0.174,
+  "pearson_p": 0.07111799880260906,
+  "spearman_rho": -0.128,
+  "spearman_p": 0.18561466962056436,
+  "window_start": "20260507",
+  "window_end": "20260603"
+}
