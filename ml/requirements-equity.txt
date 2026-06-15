@@ -1,0 +1,13 @@
+# Phase 8 — transit equity analysis. Heavy, OFFLINE-ONLY deps; do NOT add to any
+# Lambda. Install into a dedicated venv (kept out of the 3.11 test venv):
+#   python3 -m venv ml/.venv-equity
+#   ml/.venv-equity/bin/pip install -r ml/requirements-equity.txt
+#
+# `arcgis` (the ArcGIS Python API) is large (hundreds of MB + native deps) and
+# pulls its own pandas/numpy. geopandas brings pyproj + shapely + a GEOS stack.
+geopandas>=1.0,<2
+shapely>=2.0,<3
+pandas>=2.2,<3
+scipy>=1.13,<2
+boto3>=1.34
+arcgis>=2.3
