@@ -47,7 +47,7 @@ jobs:
           chmod +x scripts/build-lambda.sh
           # train_model is intentionally absent: it's a container-image Lambda
           # (Dockerfile), built by `cdk synth` below, not a zip asset.
-          for d in ingestion enrichment query_api aggregation websocket user_api post_confirmation feature_snapshot data_sufficiency_check evaluate_model promote_model; do
+          for d in ingestion enrichment query_api aggregation websocket user_api post_confirmation feature_snapshot data_sufficiency_check evaluate_model promote_model precompute_predictions update_endpoint; do
             scripts/build-lambda.sh "$d"
           done
       - name: Build frontend static export
