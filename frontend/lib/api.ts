@@ -69,6 +69,28 @@ export async function fetchRouteAggregates(
   return body.windows ?? [];
 }
 
+export interface RoutePrediction {
+  route_id: string;
+  predicted_next_window_avg_delay_seconds: number;
+  current_avg_delay_seconds: number;
+  model_version: string;
+  window_start_iso: string;
+  as_of: string;
+}
+
+export async function fetchRoutePrediction(
+  routeId: string,
+  signal?: AbortSignal,
+): Promise<RoutePrediction | null> {
+  const base = apiBase();
+  if (!base) return null;
+  const url = `${base}/routes/${encodeURIComponent(routeId)}/prediction`;
+  const res = await fetch(url, { signal, cache: 'no-store' });
+  if (res.status === 404) return null;
+  if (!res.ok) throw new Error(`API ${res.status}`);
+  return (await res.json()) as RoutePrediction;
+}
+
 // Phase 4d — stops + arrivals
 
 export async function fetchStops(signal?: AbortSignal): Promise<StopsResponse | null> {

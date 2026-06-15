@@ -12,7 +12,12 @@ import {
   XAxis,
   YAxis,
 } from 'recharts';
-import { fetchRouteAggregates, type RouteAggregateWindow } from '@/lib/api';
+import {
+  fetchRouteAggregates,
+  fetchRoutePrediction,
+  type RouteAggregateWindow,
+  type RoutePrediction,
+} from '@/lib/api';
 import { delayLabel } from '@/lib/colors';
 
 function RoutePageInner() {
@@ -21,6 +26,7 @@ function RoutePageInner() {
   const [windows, setWindows] = useState<RouteAggregateWindow[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+  const [prediction, setPrediction] = useState<RoutePrediction | null>(null);
 
   useEffect(() => {
     if (!routeId) {
@@ -41,6 +47,18 @@ function RoutePageInner() {
       })
       .finally(() => setLoading(false));
     return () => ctrl.abort();
+  }, [routeId]);
+
+  useEffect(() => {
+    if (!routeId) return;
+    const ctrl = new AbortController();
+    fetchRoutePrediction(routeId, ctrl.signal)
+      .then(setPrediction)
+      .catch(() => setPrediction(null));
+    const id = setInterval(() => {
+      fetchRoutePrediction(routeId).then(setPrediction).catch(() => {});
+    }, 60_000);
+    return () => { ctrl.abort(); clearInterval(id); };
   }, [routeId]);
 
   if (!routeId) return <RouteMissing />;
@@ -92,6 +110,26 @@ function RoutePageInner() {
                 value={totalVehicles.toLocaleString()}
               />
             </section>
+
+            {prediction && (
+              <section className="mt-6 rounded bg-zinc-900/50 p-4">
+                <div className="text-xs uppercase tracking-wide text-zinc-500">trendline</div>
+                <div className="mt-1 text-lg">
+                  Currently <span className="font-mono">
+                    {formatDelay(prediction.current_avg_delay_seconds)}
+                  </span>, predicted <span className="font-mono">
+                    {formatDelay(prediction.predicted_next_window_avg_delay_seconds)}
+                  </span>{' '}
+                  <TrendArrow
+                    current={prediction.current_avg_delay_seconds}
+                    predicted={prediction.predicted_next_window_avg_delay_seconds}
+                  />
+                </div>
+                <div className="mt-1 text-xs text-zinc-500">
+                  model {prediction.model_version}
+                </div>
+              </section>
+            )}
 
             <section className="mt-8">
               <h2 className="mb-2 text-sm font-medium uppercase tracking-wide text-zinc-400">
@@ -198,6 +236,26 @@ function Stat({ label, value }: { label: string; value: string }) {
       <div className="text-xs uppercase tracking-wide text-zinc-500">{label}</div>
       <div className="mt-1 text-2xl font-semibold">{value}</div>
     </div>
+  );
+}
+
+function formatDelay(seconds: number): string {
+  const sign = seconds > 0 ? '+' : seconds < 0 ? '−' : '';
+  const mins = Math.round(Math.abs(seconds) / 60);
+  return `${sign}${mins} min`;
+}
+
+function TrendArrow({ current, predicted }: { current: number; predicted: number }) {
+  const delta = predicted - current;
+  if (Math.abs(delta) < 30) return <span aria-label="steady">→</span>;  // <30s = flat
+  const up = delta > 0;
+  return (
+    <span
+      className={up ? 'text-red-400' : 'text-emerald-400'}
+      aria-label={up ? 'worsening' : 'improving'}
+    >
+      {up ? '↑' : '↓'}
+    </span>
   );
 }
 
