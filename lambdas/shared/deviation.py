@@ -10,8 +10,8 @@ Design choices:
   - Coordinates are projected to a local equirectangular metric system at LA's
     reference latitude. Within LA County the distortion is < 0.5%, which is
     well inside the 200m off-route tolerance and any meaningful delay budget.
-    We avoid pyproj (~30 MB dep) for this — it's a standard simplification
-    that interview-grade explanations can defend.
+    We avoid pyproj (~30 MB dep) for this — it's a standard, well-documented
+    simplification.
   - Shapely (with bundled GEOS) handles the actual point-on-line projection
     and perpendicular-distance check. ~5 MB packaged, ARM64-compatible
     wheels available, and the interface is the cleanest in the ecosystem.

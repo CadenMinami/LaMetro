@@ -68,8 +68,8 @@ export class FrontendStack extends cdk.Stack {
         { httpStatus: 403, responseHttpStatus: 200, responsePagePath: '/index.html' },
         { httpStatus: 404, responseHttpStatus: 200, responsePagePath: '/index.html' },
       ],
-      // PriceClass 100 = US/Canada/Europe edges only. Cuts CDN cost; fine for
-      // a portfolio. Switch to ALL when serving global users.
+      // PriceClass 100 = US/Canada/Europe edges only. Cuts CDN cost for a
+      // US-focused audience. Switch to ALL when serving global users.
       priceClass: cloudfront.PriceClass.PRICE_CLASS_100,
     });
 

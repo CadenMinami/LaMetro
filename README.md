@@ -69,10 +69,3 @@ scripts/cdk destroy --all
 ```
 
 The ingestion handler is generic GTFS-RT (LA Metro via Swiftly by default), so the pipeline can be pointed at any agency's feed by changing one env var.
-
-## Future work
-
-- **Email alerts:** the per-user "email me" toggle is built and persisted; wiring it to SES (or SNS→Lambda→SES) remains, deferred to avoid the SES sandbox during the build.
-- **Per-stop directional geofences:** geofences currently fire on a route's average delay; the reserved `stop_id` field lets alerts later target the next vehicle approaching a specific stop in the user's direction.
-- **Real-time alert push:** notifications poll every 60s; they could ride the existing WebSocket for instant delivery once the socket is authenticated.
-- **SageMaker-native training:** flip `useSagemakerTraining` once the account's training quota is granted (the pipeline already supports it).

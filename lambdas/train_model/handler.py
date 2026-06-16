@@ -60,7 +60,7 @@ def split(
     X: np.ndarray, y: np.ndarray, *, frac: float = 0.8, seed: int = 0
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Deterministic train/validation split. Both sides non-empty when n>=2;
-    single-row input evaluates on the training row (portfolio first-model guard).
+    single-row input evaluates on the training row (first-model cold-start guard).
     """
     n = X.shape[0]
     rng = np.random.RandomState(seed)
