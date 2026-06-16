@@ -46,7 +46,7 @@ Full diagram, stack-by-stack breakdown, table designs, and the schedule-deviatio
 
 ## Cost discipline
 
-Hard cap: **$30/month** during active development, **$15/month** idle. CloudWatch billing alarm at $20, AWS Budget at $30, all resources tagged `Project=la-metro` for Cost Explorer filtering. Cost-control choices are baked into the architecture: a single Kinesis shard, DynamoDB on-demand, **SageMaker Serverless** (scale-to-zero) inference, and an ingestion pipeline that **scales to zero when no one is viewing the dashboard**. `cdk destroy` everything during long breaks.
+Hard cap: **$30/month** during active development, **$15/month** idle. Net billed to date is **~$0** (Free Tier + credits); on list price, making ingestion **scale to zero** cut the dominant cost (DynamoDB) by **94% — $56→$3/mo**, leaving the single Kinesis shard (~$11/mo) as the idle floor. Cost-control choices are baked in: one Kinesis shard, DynamoDB on-demand, **SageMaker Serverless** inference ($0.06/mo), and scale-to-zero ingestion. Full breakdown with real per-service numbers: **[docs/COST.md](docs/COST.md)**. `cdk destroy` everything during long breaks.
 
 ## Local development
 
