@@ -4,7 +4,7 @@ A real-time, AWS-native platform that ingests live LA Metro GTFS-Realtime feeds,
 
 **Live demo:** https://d1trwh3zs290xm.cloudfront.net · **Equity map:** https://d1trwh3zs290xm.cloudfront.net/equity/ · _Demo video: coming soon_
 
-> Portfolio project for an AWS internship application. Every architectural choice is meant to be defensible in a technical interview — see [docs/TRADEOFFS.md](docs/TRADEOFFS.md).
+> Every architectural decision was made deliberately, weighing the rationale and tradeoffs against the alternatives.
 
 ## The problem
 
@@ -13,8 +13,6 @@ Transit riders don't care about average performance — they care whether *their
 ## Architecture
 
 GTFS-RT → Kinesis → enrichment Lambda (schedule deviation) → DynamoDB hot state + Firehose → S3 → Athena / SageMaker. A nightly Step Functions pipeline retrains an XGBoost delay model; a Serverless Inference endpoint backs precomputed per-route predictions. The Next.js + ArcGIS frontend is served from CloudFront and pushed live updates over API Gateway WebSockets.
-
-Full diagram, stack-by-stack breakdown, table designs, and the schedule-deviation algorithm: **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**.
 
 ### Tech stack
 - **AWS:** Kinesis, Lambda, DynamoDB, Firehose, S3, Athena/Glue, SageMaker (Serverless Inference), Step Functions, EventBridge, API Gateway (REST + WebSocket), Cognito, SNS, CloudFront, CloudWatch — all via **CDK v2 (TypeScript)**.
@@ -34,7 +32,7 @@ Full diagram, stack-by-stack breakdown, table designs, and the schedule-deviatio
 | 6 | Cognito auth + SNS geofence alerts | ✅ deployed |
 | 7 | SageMaker delay predictor + Step Functions retraining | ✅ deployed |
 | 8 | Equity analysis (ArcGIS Living Atlas + census) | ✅ deployed |
-| 9 | Polish — docs, diagram, demo, cost report | in progress |
+| 9 | Polish — diagram, demo, cost report | in progress |
 
 ## Equity finding (Phase 8)
 
@@ -42,11 +40,11 @@ Full diagram, stack-by-stack breakdown, table designs, and the schedule-deviatio
 
 **Answer: no — and that's the finding.** Joining ~4 weeks of per-route on-time performance to ACS median household income (ArcGIS Living Atlas) across all ~2,495 LA County census tracts, there is **no statistically significant relationship** between neighborhood income and reliability (Pearson r = −0.17, p = 0.07; n = 108 routes). LA Metro is *uniformly* unreliable — ~26% on-time within ±60s — regardless of income. The faint, non-significant trend runs **opposite** the usual equity narrative (denser, higher-income job corridors trend slightly *less* reliable), consistent with congestion rather than income driving delay. The unreliability is **system-wide, not an income gap**.
 
-**The more interesting story is how that answer held up.** An intermediate run looked significant (r = −0.26, p = 0.009) — but only because the ArcGIS feature service silently capped responses, so the join used just 1,769 of 2,495 tracts. Adding stable-sorted pagination to pull *all* tracts weakened the effect back to non-significant. A result that gets *less* impressive as the data gets *more* complete is exactly the false positive you want to catch before publishing. Full write-up: [docs/PHASE_8_EQUITY_FINDING.md](docs/PHASE_8_EQUITY_FINDING.md); reproduce with `ml/equity_analysis.py`.
+**The more interesting story is how that answer held up.** An intermediate run looked significant (r = −0.26, p = 0.009) — but only because the ArcGIS feature service silently capped responses, so the join used just 1,769 of 2,495 tracts. Adding stable-sorted pagination to pull *all* tracts weakened the effect back to non-significant. A result that gets *less* impressive as the data gets *more* complete is exactly the false positive you want to catch before publishing. Reproduce with `ml/equity_analysis.py`.
 
 ## Cost discipline
 
-Hard cap: **$30/month** during active development, **$15/month** idle. Net billed to date is **~$0** (Free Tier + credits); on list price, making ingestion **scale to zero** cut the dominant cost (DynamoDB) by **94% — $56→$3/mo**, leaving the single Kinesis shard (~$11/mo) as the idle floor. Cost-control choices are baked in: one Kinesis shard, DynamoDB on-demand, **SageMaker Serverless** inference ($0.06/mo), and scale-to-zero ingestion. Full breakdown with real per-service numbers: **[docs/COST.md](docs/COST.md)**. `cdk destroy` everything during long breaks.
+Hard cap: **$30/month** during active development, **$15/month** idle. Net billed to date is **~$0** (Free Tier + credits); on list price, making ingestion **scale to zero** cut the dominant cost (DynamoDB) by **94% — $56→$3/mo**, leaving the single Kinesis shard (~$11/mo) as the idle floor. Cost-control choices are baked in: one Kinesis shard, DynamoDB on-demand, **SageMaker Serverless** inference ($0.06/mo), and scale-to-zero ingestion. `cdk destroy` everything during long breaks.
 
 ## Local development
 

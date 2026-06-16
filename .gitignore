@@ -49,3 +49,6 @@ lambdas/**/.layer/
 # Phase 8 equity analysis venv (heavy, local only)
 ml/.venv-equity/
 ml/.env-equity
+
+# Project docs/specs — kept local, not published
+docs/
